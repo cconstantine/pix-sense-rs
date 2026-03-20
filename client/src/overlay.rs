@@ -1,13 +1,11 @@
-use crate::face::FaceDetection;
 use egui::{Color32, Painter, Pos2, Stroke, StrokeKind};
+use pix_sense_common::FaceDetection;
 
 const BBOX_COLOR: Color32 = Color32::from_rgb(0, 255, 255);
 const EYE_COLOR: Color32 = Color32::from_rgb(0, 255, 0);
 const LANDMARK_COLOR: Color32 = Color32::from_rgb(255, 255, 0);
 const EYE_RADIUS: f32 = 6.0;
 const LANDMARK_RADIUS: f32 = 3.0;
-
-/// Landmark indices: 0=left_eye, 1=right_eye, 2=nose, 3=left_mouth, 4=right_mouth
 
 /// Draw face detections with eye landmarks on the egui painter.
 pub fn draw_faces(

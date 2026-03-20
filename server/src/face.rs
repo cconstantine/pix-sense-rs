@@ -5,6 +5,7 @@ use ort::{
     session::{Session, builder::GraphOptimizationLevel},
     value::Tensor,
 };
+use pix_sense_common::{FaceDetection, FaceLandmark};
 
 const MODEL_INPUT_SIZE: u32 = 640;
 const CONF_THRESHOLD: f32 = 0.5;
@@ -14,20 +15,6 @@ const INPUT_STD: f32 = 128.0;
 
 const STRIDES: [u32; 3] = [8, 16, 32];
 const NUM_ANCHORS: u32 = 2;
-
-#[derive(Debug, Clone, Copy)]
-pub struct FaceLandmark {
-    pub x: f32,
-    pub y: f32,
-}
-
-#[derive(Debug, Clone)]
-pub struct FaceDetection {
-    pub bbox: [f32; 4], // x1, y1, x2, y2
-    pub confidence: f32,
-    /// 5 landmarks: left_eye, right_eye, nose, left_mouth, right_mouth
-    pub landmarks: [FaceLandmark; 5],
-}
 
 pub struct FaceDetector {
     session: Session,
@@ -51,10 +38,7 @@ impl FaceDetector {
             .context(format!("Failed to load model from {}", model_path))?;
 
         tracing::info!("Face detection model loaded from {}", model_path);
-        tracing::info!(
-            "Model has {} outputs",
-            session.outputs().len()
-        );
+        tracing::info!("Model has {} outputs", session.outputs().len());
 
         Ok(FaceDetector { session })
     }
@@ -80,7 +64,6 @@ impl FaceDetector {
         pad_x: f32,
         pad_y: f32,
     ) -> Result<Vec<FaceDetection>> {
-
         let input_tensor = Tensor::from_array((
             [1usize, 3, MODEL_INPUT_SIZE as usize, MODEL_INPUT_SIZE as usize],
             input_data.into_boxed_slice(),
@@ -107,7 +90,6 @@ impl FaceDetector {
             let feat_h = MODEL_INPUT_SIZE / stride;
             let feat_w = MODEL_INPUT_SIZE / stride;
 
-            // Extract score, bbox, and kps tensors for this stride
             let (_, scores_data) = outputs[idx]
                 .try_extract_tensor::<f32>()
                 .context("Failed to extract score tensor")?;
@@ -123,7 +105,6 @@ impl FaceDetector {
                 None
             };
 
-            // Generate anchors and decode detections
             let num_positions = (feat_h * feat_w) as usize;
 
             for pos in 0..num_positions {
@@ -140,20 +121,17 @@ impl FaceDetector {
                         continue;
                     }
 
-                    // Decode bbox: distance from anchor, scaled by stride
                     let bbox_offset = anchor_idx * 4;
                     let d0 = bbox_data[bbox_offset] * stride as f32;
                     let d1 = bbox_data[bbox_offset + 1] * stride as f32;
                     let d2 = bbox_data[bbox_offset + 2] * stride as f32;
                     let d3 = bbox_data[bbox_offset + 3] * stride as f32;
 
-                    // Map back to original image coordinates
                     let x1 = ((anchor_x - d0 - pad_x) / scale).clamp(0.0, img_w as f32);
                     let y1 = ((anchor_y - d1 - pad_y) / scale).clamp(0.0, img_h as f32);
                     let x2 = ((anchor_x + d2 - pad_x) / scale).clamp(0.0, img_w as f32);
                     let y2 = ((anchor_y + d3 - pad_y) / scale).clamp(0.0, img_h as f32);
 
-                    // Decode landmarks
                     let landmarks = if let Some(ref kps) = kps_data {
                         let kps_offset = anchor_idx * 10;
                         let mut lms = [FaceLandmark { x: 0.0, y: 0.0 }; 5];
@@ -247,8 +225,6 @@ fn preprocess_gray(image: &GrayImage) -> (Vec<f32>, f32, f32, f32) {
     );
     image::imageops::overlay(&mut padded, &resized, pad_x_i as i64, pad_y_i as i64);
 
-    // Convert to NCHW flat vec, replicate grayscale across 3 channels
-    // Normalized: (pixel - 127.5) / 128.0
     let sz = MODEL_INPUT_SIZE as usize;
     let mut data = vec![0.0f32; 3 * sz * sz];
     for y in 0..sz {

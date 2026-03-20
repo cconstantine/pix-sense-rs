@@ -75,34 +75,28 @@ impl PoseEstimator {
     pub fn estimate(&mut self, image: &RgbImage) -> Result<Vec<Pose>> {
         let (img_w, img_h) = (image.width(), image.height());
 
-        // Preprocess: letterbox resize to 640x640, produce NCHW float32
         let (input_data, scale, pad_x, pad_y) = preprocess(image);
 
-        // Create input tensor
         let input_tensor = Tensor::from_array((
             [1usize, 3, MODEL_INPUT_SIZE as usize, MODEL_INPUT_SIZE as usize],
             input_data.into_boxed_slice(),
         ))
         .context("Failed to create input tensor")?;
 
-        // Run inference
         let outputs = self
             .session
             .run(ort::inputs![input_tensor])
             .context("Inference failed")?;
 
-        // Get output - YOLOv8-pose: [1, 56, 8400]
         let (shape, output_data) = outputs[0]
             .try_extract_tensor::<f32>()
             .context("Failed to extract output tensor")?;
 
-        let num_detections = shape[2] as usize; // 8400
+        let num_detections = shape[2] as usize;
 
-        // Parse detections (output is [1, 56, 8400], we need to transpose)
         let mut poses = Vec::new();
 
         for det in 0..num_detections {
-            // Access transposed: feature f of detection det = output_data[f * num_detections + det]
             let cx = output_data[0 * num_detections + det];
             let cy = output_data[1 * num_detections + det];
             let w = output_data[2 * num_detections + det];
@@ -113,13 +107,11 @@ impl PoseEstimator {
                 continue;
             }
 
-            // Convert center format to corner format and scale to original image
             let x1 = ((cx - w / 2.0 - pad_x) / scale).clamp(0.0, img_w as f32);
             let y1 = ((cy - h / 2.0 - pad_y) / scale).clamp(0.0, img_h as f32);
             let x2 = ((cx + w / 2.0 - pad_x) / scale).clamp(0.0, img_w as f32);
             let y2 = ((cy + h / 2.0 - pad_y) / scale).clamp(0.0, img_h as f32);
 
-            // Parse 17 keypoints (each has x, y, confidence)
             let mut keypoints = Vec::with_capacity(17);
             for k in 0..17 {
                 let kx_idx = (5 + k * 3) * num_detections + det;
@@ -144,14 +136,12 @@ impl PoseEstimator {
             });
         }
 
-        // Apply NMS
         nms(&mut poses);
 
         Ok(poses)
     }
 }
 
-/// Preprocess image: letterbox resize to 640x640, return flat NCHW Vec.
 fn preprocess(image: &RgbImage) -> (Vec<f32>, f32, f32, f32) {
     let (img_w, img_h) = (image.width() as f32, image.height() as f32);
     let target = MODEL_INPUT_SIZE as f32;
@@ -175,15 +165,14 @@ fn preprocess(image: &RgbImage) -> (Vec<f32>, f32, f32, f32) {
     );
     image::imageops::overlay(&mut padded, &resized, pad_x_i as i64, pad_y_i as i64);
 
-    // Convert to NCHW flat vec, normalized [0, 1]
     let sz = MODEL_INPUT_SIZE as usize;
     let mut data = vec![0.0f32; 3 * sz * sz];
     for y in 0..sz {
         for x in 0..sz {
             let pixel = padded.get_pixel(x as u32, y as u32);
-            data[0 * sz * sz + y * sz + x] = pixel[0] as f32 / 255.0; // R
-            data[1 * sz * sz + y * sz + x] = pixel[1] as f32 / 255.0; // G
-            data[2 * sz * sz + y * sz + x] = pixel[2] as f32 / 255.0; // B
+            data[0 * sz * sz + y * sz + x] = pixel[0] as f32 / 255.0;
+            data[1 * sz * sz + y * sz + x] = pixel[1] as f32 / 255.0;
+            data[2 * sz * sz + y * sz + x] = pixel[2] as f32 / 255.0;
         }
     }
 

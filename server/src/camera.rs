@@ -3,7 +3,7 @@ use image::{GrayImage, RgbImage};
 use realsense_rust::{
     config::Config,
     context::Context as RsContext,
-    frame::{ColorFrame, InfraredFrame},
+    frame::{ColorFrame, DepthFrame, InfraredFrame},
     kind::{Rs2CameraInfo, Rs2Format, Rs2StreamKind},
     pipeline::InactivePipeline,
 };
@@ -16,6 +16,8 @@ pub struct Camera {
 pub struct CameraFrames {
     pub rgb: RgbImage,
     pub ir: GrayImage,
+    pub depth: GrayImage,
+    pub depth_size: [u32; 2],
 }
 
 impl Camera {
@@ -50,6 +52,9 @@ impl Camera {
         config
             .enable_stream(Rs2StreamKind::Infrared, None, 640, 480, Rs2Format::Y8, 30)
             .context("Failed to enable infrared stream")?;
+        config
+            .enable_stream(Rs2StreamKind::Depth, None, 640, 480, Rs2Format::Z16, 30)
+            .context("Failed to enable depth stream")?;
 
         let pipeline = pipeline
             .start(Some(config))
@@ -115,12 +120,61 @@ impl Camera {
             }
         }
 
+        // Extract depth frames (Z16: 16-bit unsigned, millimeters)
+        // Map to 8-bit grayscale with a fixed range for speed; colorize on the client.
+        let mut depth_image = None;
+        let mut depth_w = 640u32;
+        let mut depth_h = 480u32;
+        let depth_frames = frames.frames_of_type::<DepthFrame>();
+        if let Some(depth) = depth_frames.first() {
+            let w = depth.width() as u32;
+            let h = depth.height() as u32;
+            depth_w = w;
+            depth_h = h;
+
+            let data_size = depth.get_data_size();
+            let expected = (w * h * 2) as usize; // Z16 = 2 bytes per pixel
+            if data_size >= expected {
+                let raw = unsafe {
+                    std::slice::from_raw_parts(
+                        depth.get_data() as *const std::os::raw::c_void as *const u16,
+                        (w * h) as usize,
+                    )
+                };
+                depth_image = Some(depth_to_gray(raw, w, h));
+            }
+        }
+
         let rgb = rgb_image.unwrap_or_else(|| RgbImage::new(rgb_w, rgb_h));
         let ir = ir_image.unwrap_or_else(|| GrayImage::new(640, 480));
+        let depth = depth_image.unwrap_or_else(|| GrayImage::new(depth_w, depth_h));
 
         Ok(Some(CameraFrames {
             rgb,
             ir,
+            depth,
+            depth_size: [depth_w, depth_h],
         }))
     }
+}
+
+/// Map Z16 depth to 8-bit grayscale using a fixed range (300–5000 mm).
+/// 0 → black (no data), near → bright, far → dark.
+fn depth_to_gray(data: &[u16], w: u32, h: u32) -> GrayImage {
+    const MIN_MM: u16 = 300;
+    const MAX_MM: u16 = 5000;
+    const RANGE: f32 = (MAX_MM - MIN_MM) as f32;
+
+    let mut pixels = Vec::with_capacity((w * h) as usize);
+    for &d in data {
+        let v = if d == 0 || d < MIN_MM {
+            0u8
+        } else if d >= MAX_MM {
+            255
+        } else {
+            ((d - MIN_MM) as f32 / RANGE * 255.0) as u8
+        };
+        pixels.push(v);
+    }
+    GrayImage::from_raw(w, h, pixels).unwrap_or_else(|| GrayImage::new(w, h))
 }
