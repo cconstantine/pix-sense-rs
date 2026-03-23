@@ -1,6 +1,5 @@
 mod camera;
 mod face;
-mod pose;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use axum::{
     routing::get,
     Router,
 };
-use image::{ImageEncoder, RgbImage};
+use image::RgbImage;
 use pix_sense_common::{encode_frame_message, FaceDetection, FrameMetadata};
 use tokio::sync::watch;
 use tower_http::services::ServeDir;
@@ -127,6 +126,17 @@ fn processing_thread(
     let mut camera = Camera::new()?;
     tracing::info!("Camera initialized");
 
+    // Pipeline: detection thread sends FrameData to encode thread via bounded channel.
+    // Capacity 1 so we never buffer stale frames — detection blocks until encode consumes.
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameData>(1);
+
+    // Encode thread: JPEG-encodes frames (CPU/NEON) while detection uses GPU
+    let encode_running = Arc::new(AtomicBool::new(true));
+    let encode_running_clone = encode_running.clone();
+    let encode_handle = std::thread::spawn(move || {
+        encode_thread(frame_rx, tx, &encode_running_clone);
+    });
+
     let mut frame_count = 0u64;
     let mut log_interval = std::time::Instant::now();
 
@@ -173,67 +183,92 @@ fn processing_thread(
             ir_faces,
         };
 
-        let t0 = std::time::Instant::now();
-        let msg = encode_frame(&data);
-        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if frame_tx.send(data).is_err() {
+            break; // encode thread exited
+        }
 
-        let _ = tx.send(Arc::new(msg));
-
-        let total_ms = t_loop.elapsed().as_secs_f64() * 1000.0;
+        let detect_ms = t_loop.elapsed().as_secs_f64() * 1000.0;
         frame_count += 1;
 
         // Log timing every 2 seconds
         if log_interval.elapsed().as_secs_f64() >= 2.0 {
             tracing::info!(
-                "frame {}: capture={:.1}ms  rgb_detect={:.1}ms  ir_detect={:.1}ms  encode={:.1}ms  total={:.1}ms ({:.1} fps)",
+                "frame {}: capture={:.1}ms  rgb={:.1}ms  ir={:.1}ms  detect_total={:.1}ms ({:.1} fps)",
                 frame_count,
                 capture_ms,
                 rgb_detect_ms,
                 ir_detect_ms,
-                encode_ms,
-                total_ms,
-                1000.0 / total_ms,
+                detect_ms,
+                1000.0 / detect_ms,
             );
             log_interval = std::time::Instant::now();
         }
     }
 
+    encode_running.store(false, Ordering::Relaxed);
+    drop(frame_tx);
+    let _ = encode_handle.join();
+
     tracing::info!("Processing thread shutting down");
     Ok(())
 }
 
-fn encode_frame(data: &FrameData) -> Vec<u8> {
-    // Encode RGB as JPEG
-    let mut rgb_jpeg = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut rgb_jpeg, 75)
-        .write_image(
-            data.rgb.as_raw(),
-            data.rgb.width(),
-            data.rgb.height(),
-            image::ExtendedColorType::Rgb8,
-        )
+fn encode_thread(
+    rx: std::sync::mpsc::Receiver<FrameData>,
+    tx: watch::Sender<Arc<Vec<u8>>>,
+    running: &AtomicBool,
+) {
+    let mut compressor = match turbojpeg::Compressor::new() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to create JPEG compressor: {}", e);
+            return;
+        }
+    };
+    compressor.set_quality(75).ok();
+
+    while running.load(Ordering::Relaxed) {
+        let data = match rx.recv() {
+            Ok(d) => d,
+            Err(_) => break, // sender dropped
+        };
+
+        let msg = encode_frame(&mut compressor, &data);
+        let _ = tx.send(Arc::new(msg));
+    }
+}
+
+fn encode_frame(compressor: &mut turbojpeg::Compressor, data: &FrameData) -> Vec<u8> {
+    compressor.set_subsamp(turbojpeg::Subsamp::Sub2x2).ok();
+    let rgb_jpeg = compressor
+        .compress_to_vec(turbojpeg::Image {
+            pixels: data.rgb.as_raw().as_slice(),
+            width: data.rgb.width() as usize,
+            pitch: data.rgb.width() as usize * 3,
+            height: data.rgb.height() as usize,
+            format: turbojpeg::PixelFormat::RGB,
+        })
         .expect("JPEG encode failed");
 
-    // Encode IR (grayscale) as JPEG
-    let mut ir_jpeg = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut ir_jpeg, 75)
-        .write_image(
-            data.ir.as_raw(),
-            data.ir.width(),
-            data.ir.height(),
-            image::ExtendedColorType::L8,
-        )
+    compressor.set_subsamp(turbojpeg::Subsamp::Gray).ok();
+    let ir_jpeg = compressor
+        .compress_to_vec(turbojpeg::Image {
+            pixels: data.ir.as_raw().as_slice(),
+            width: data.ir.width() as usize,
+            pitch: data.ir.width() as usize,
+            height: data.ir.height() as usize,
+            format: turbojpeg::PixelFormat::GRAY,
+        })
         .expect("JPEG encode failed");
 
-    // Encode depth (grayscale) as JPEG
-    let mut depth_jpeg = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut depth_jpeg, 75)
-        .write_image(
-            data.depth.as_raw(),
-            data.depth.width(),
-            data.depth.height(),
-            image::ExtendedColorType::L8,
-        )
+    let depth_jpeg = compressor
+        .compress_to_vec(turbojpeg::Image {
+            pixels: data.depth.as_raw().as_slice(),
+            width: data.depth.width() as usize,
+            pitch: data.depth.width() as usize,
+            height: data.depth.height() as usize,
+            format: turbojpeg::PixelFormat::GRAY,
+        })
         .expect("JPEG encode failed");
 
     let metadata = FrameMetadata {

@@ -1,0 +1,14 @@
+{
+  "name": "pix-sense-rs",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "dev",
+  "workspaceFolder": "/app",
+  "remoteUser": "dev",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  }
+}

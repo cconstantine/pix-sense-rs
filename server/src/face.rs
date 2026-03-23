@@ -1,11 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use image::{GrayImage, RgbImage};
-use ort::{
-    ep,
-    session::{Session, builder::GraphOptimizationLevel},
-    value::Tensor,
-};
 use pix_sense_common::{FaceDetection, FaceLandmark};
+use std::ffi::{CStr, CString, c_char};
+use std::os::raw::c_int;
+use std::path::Path;
 
 const MODEL_INPUT_SIZE: u32 = 640;
 const CONF_THRESHOLD: f32 = 0.5;
@@ -16,31 +14,192 @@ const INPUT_STD: f32 = 128.0;
 const STRIDES: [u32; 3] = [8, 16, 32];
 const NUM_ANCHORS: u32 = 2;
 
+// FFI bindings to trt_wrapper.cpp
+#[repr(C)]
+struct TrtEngine {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    fn trt_engine_create(
+        onnx_path: *const c_char,
+        cache_path: *const c_char,
+        fp16: c_int,
+    ) -> *mut TrtEngine;
+    fn trt_engine_destroy(engine: *mut TrtEngine);
+    fn trt_engine_num_io(engine: *mut TrtEngine) -> i32;
+    fn trt_engine_tensor_name(engine: *mut TrtEngine, index: i32) -> *const c_char;
+    fn trt_engine_tensor_is_input(engine: *mut TrtEngine, name: *const c_char) -> i32;
+    fn trt_engine_tensor_shape(
+        engine: *mut TrtEngine,
+        name: *const c_char,
+        dims: *mut i64,
+        nb_dims: *mut i32,
+    );
+    fn trt_engine_infer(
+        engine: *mut TrtEngine,
+        input_data: *const f32,
+        input_bytes: usize,
+        output_ptrs: *mut *mut f32,
+        output_sizes: *mut usize,
+        num_outputs: i32,
+    ) -> i32;
+}
+
+/// Maps output tensor indices by type and stride order.
+/// Indices refer to positions in the output-only tensor list.
+struct OutputMap {
+    /// Score tensor indices, ordered by stride [8, 16, 32]
+    scores: [usize; 3],
+    /// Bbox tensor indices, ordered by stride [8, 16, 32]
+    bboxes: [usize; 3],
+    /// Keypoint tensor indices (if present), ordered by stride [8, 16, 32]
+    kps: Option<[usize; 3]>,
+}
+
 pub struct FaceDetector {
-    session: Session,
+    engine: *mut TrtEngine,
+    output_map: OutputMap,
+    num_outputs: usize,
+    output_sizes: Vec<usize>,
+    // Pre-allocated buffers reused across inference calls
+    output_bufs: Vec<Vec<f32>>,
+}
+
+unsafe impl Send for FaceDetector {}
+
+impl Drop for FaceDetector {
+    fn drop(&mut self) {
+        unsafe {
+            trt_engine_destroy(self.engine);
+        }
+    }
 }
 
 impl FaceDetector {
     pub fn new(model_path: &str) -> Result<Self> {
-        let session = Session::builder()
-            .context("Failed to create session builder")?
-            .with_optimization_level(GraphOptimizationLevel::Level1)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to set optimization level: {}", e);
-                e.recover()
-            })
-            .with_execution_providers([ep::CUDA::default().build()])
-            .unwrap_or_else(|e| {
-                tracing::warn!("CUDA EP not available, falling back to CPU: {}", e);
-                e.recover()
-            })
-            .commit_from_file(model_path)
-            .context(format!("Failed to load model from {}", model_path))?;
+        // Derive cache path from model path: models/foo.onnx -> models/foo.engine
+        let cache_path = Path::new(model_path).with_extension("engine");
+        let onnx_cstr =
+            CString::new(model_path).context("Invalid model path")?;
+        let cache_cstr =
+            CString::new(cache_path.to_str().unwrap_or("")).context("Invalid cache path")?;
 
-        tracing::info!("Face detection model loaded from {}", model_path);
-        tracing::info!("Model has {} outputs", session.outputs().len());
+        let engine = unsafe { trt_engine_create(onnx_cstr.as_ptr(), cache_cstr.as_ptr(), 1) };
+        if engine.is_null() {
+            bail!("Failed to create TensorRT engine from {}", model_path);
+        }
 
-        Ok(FaceDetector { session })
+        // Query I/O tensors and build output map
+        let num_io = unsafe { trt_engine_num_io(engine) };
+        let mut outputs: Vec<(usize, String, Vec<i64>)> = Vec::new(); // (output_index, name, shape)
+        let mut out_idx = 0usize;
+
+        for i in 0..num_io {
+            let name_ptr = unsafe { trt_engine_tensor_name(engine, i) };
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_str()
+                .unwrap_or("")
+                .to_string();
+            let name_c = CString::new(name.as_str()).unwrap();
+            let is_input = unsafe { trt_engine_tensor_is_input(engine, name_c.as_ptr()) };
+            if is_input == 1 {
+                continue;
+            }
+
+            let mut dims = [0i64; 8];
+            let mut nb_dims = 0i32;
+            unsafe {
+                trt_engine_tensor_shape(engine, name_c.as_ptr(), dims.as_mut_ptr(), &mut nb_dims);
+            }
+            let shape: Vec<i64> = dims[..nb_dims as usize].to_vec();
+            outputs.push((out_idx, name, shape));
+            out_idx += 1;
+        }
+
+        tracing::info!("TensorRT engine has {} output tensors", outputs.len());
+        for (idx, name, shape) in &outputs {
+            tracing::info!("  output[{}] '{}' shape={:?}", idx, name, shape);
+        }
+
+        // Classify outputs by last dimension: 1=score, 4=bbox, 10=kps
+        let mut score_outputs: Vec<(usize, i64)> = Vec::new(); // (out_idx, num_anchors)
+        let mut bbox_outputs: Vec<(usize, i64)> = Vec::new();
+        let mut kps_outputs: Vec<(usize, i64)> = Vec::new();
+
+        for (idx, _name, shape) in &outputs {
+            let last_dim = *shape.last().unwrap_or(&0);
+            // For SCRFD, shapes are [1, N, 1], [1, N, 4], [1, N, 10]
+            // or sometimes [1, N] for scores
+            let n = if shape.len() >= 2 { shape[shape.len() - 2] } else { shape[0] };
+            match last_dim {
+                1 => score_outputs.push((*idx, n)),
+                4 => bbox_outputs.push((*idx, n)),
+                10 => kps_outputs.push((*idx, n)),
+                _ => {
+                    // If last dim matches total anchors for a stride, it might be a flat score tensor
+                    // Try treating it as score if shape is [1, N]
+                    if shape.len() == 2 {
+                        score_outputs.push((*idx, last_dim));
+                    } else {
+                        tracing::warn!(
+                            "Unknown output tensor shape {:?} at index {}",
+                            shape,
+                            idx
+                        );
+                    }
+                }
+            }
+        }
+
+        // Sort each group by descending N (stride 8 has the most anchors)
+        score_outputs.sort_by(|a, b| b.1.cmp(&a.1));
+        bbox_outputs.sort_by(|a, b| b.1.cmp(&a.1));
+        kps_outputs.sort_by(|a, b| b.1.cmp(&a.1));
+
+        if score_outputs.len() < 3 || bbox_outputs.len() < 3 {
+            bail!(
+                "Expected at least 3 score and 3 bbox outputs, got {} scores and {} bboxes",
+                score_outputs.len(),
+                bbox_outputs.len()
+            );
+        }
+
+        let output_map = OutputMap {
+            scores: [score_outputs[0].0, score_outputs[1].0, score_outputs[2].0],
+            bboxes: [bbox_outputs[0].0, bbox_outputs[1].0, bbox_outputs[2].0],
+            kps: if kps_outputs.len() >= 3 {
+                Some([kps_outputs[0].0, kps_outputs[1].0, kps_outputs[2].0])
+            } else {
+                None
+            },
+        };
+
+        // Compute output buffer sizes
+        let num_outputs = outputs.len();
+        let mut output_sizes = Vec::with_capacity(num_outputs);
+        for (_, _, shape) in &outputs {
+            let vol: i64 = shape.iter().product();
+            output_sizes.push(vol as usize * std::mem::size_of::<f32>());
+        }
+
+        tracing::info!(
+            "Face detection model loaded via TensorRT (FP16 enabled, {} outputs)",
+            num_outputs
+        );
+
+        let output_bufs = output_sizes
+            .iter()
+            .map(|&sz| vec![0.0f32; sz / std::mem::size_of::<f32>()])
+            .collect();
+
+        Ok(FaceDetector {
+            engine,
+            output_map,
+            num_outputs,
+            output_sizes,
+            output_bufs,
+        })
     }
 
     /// Run face detection on an RGB image.
@@ -64,46 +223,39 @@ impl FaceDetector {
         pad_x: f32,
         pad_y: f32,
     ) -> Result<Vec<FaceDetection>> {
-        let input_tensor = Tensor::from_array((
-            [1usize, 3, MODEL_INPUT_SIZE as usize, MODEL_INPUT_SIZE as usize],
-            input_data.into_boxed_slice(),
-        ))
-        .context("Failed to create input tensor")?;
+        let mut output_ptrs: Vec<*mut f32> = self
+            .output_bufs
+            .iter_mut()
+            .map(|buf| buf.as_mut_ptr())
+            .collect();
 
-        let outputs = self
-            .session
-            .run(ort::inputs![input_tensor])
-            .context("Inference failed")?;
+        let mut output_sizes_bytes: Vec<usize> = self.output_sizes.clone();
 
-        let num_outputs = outputs.len();
-        let fmc = if num_outputs == 9 || num_outputs == 6 {
-            3
-        } else {
-            tracing::warn!("Unexpected number of outputs: {}, assuming fmc=3", num_outputs);
-            3
+        let input_bytes = input_data.len() * std::mem::size_of::<f32>();
+        let ret = unsafe {
+            trt_engine_infer(
+                self.engine,
+                input_data.as_ptr(),
+                input_bytes,
+                output_ptrs.as_mut_ptr(),
+                output_sizes_bytes.as_mut_ptr(),
+                self.num_outputs as i32,
+            )
         };
-        let has_kps = num_outputs >= 9;
+        if ret != 0 {
+            bail!("TensorRT inference failed with error code {}", ret);
+        }
 
+        // Decode detections
         let mut detections = Vec::new();
 
-        for (idx, &stride) in STRIDES.iter().enumerate().take(fmc) {
+        for (stride_idx, &stride) in STRIDES.iter().enumerate() {
             let feat_h = MODEL_INPUT_SIZE / stride;
             let feat_w = MODEL_INPUT_SIZE / stride;
 
-            let (_, scores_data) = outputs[idx]
-                .try_extract_tensor::<f32>()
-                .context("Failed to extract score tensor")?;
-            let (_, bbox_data) = outputs[idx + fmc]
-                .try_extract_tensor::<f32>()
-                .context("Failed to extract bbox tensor")?;
-            let kps_data = if has_kps {
-                let (_, data) = outputs[idx + fmc * 2]
-                    .try_extract_tensor::<f32>()
-                    .context("Failed to extract kps tensor")?;
-                Some(data)
-            } else {
-                None
-            };
+            let scores_data = &self.output_bufs[self.output_map.scores[stride_idx]];
+            let bbox_data = &self.output_bufs[self.output_map.bboxes[stride_idx]];
+            let kps_data = self.output_map.kps.map(|kps| &self.output_bufs[kps[stride_idx]]);
 
             let num_positions = (feat_h * feat_w) as usize;
 
@@ -192,8 +344,8 @@ fn preprocess_rgb(image: &RgbImage) -> (Vec<f32>, f32, f32, f32) {
     for y in 0..sz {
         for x in 0..sz {
             let pixel = padded.get_pixel(x as u32, y as u32);
-            data[0 * sz * sz + y * sz + x] = (pixel[0] as f32 - INPUT_MEAN) / INPUT_STD;
-            data[1 * sz * sz + y * sz + x] = (pixel[1] as f32 - INPUT_MEAN) / INPUT_STD;
+            data[y * sz + x] = (pixel[0] as f32 - INPUT_MEAN) / INPUT_STD;
+            data[sz * sz + y * sz + x] = (pixel[1] as f32 - INPUT_MEAN) / INPUT_STD;
             data[2 * sz * sz + y * sz + x] = (pixel[2] as f32 - INPUT_MEAN) / INPUT_STD;
         }
     }
@@ -230,8 +382,8 @@ fn preprocess_gray(image: &GrayImage) -> (Vec<f32>, f32, f32, f32) {
     for y in 0..sz {
         for x in 0..sz {
             let val = (padded.get_pixel(x as u32, y as u32)[0] as f32 - INPUT_MEAN) / INPUT_STD;
-            data[0 * sz * sz + y * sz + x] = val;
-            data[1 * sz * sz + y * sz + x] = val;
+            data[y * sz + x] = val;
+            data[sz * sz + y * sz + x] = val;
             data[2 * sz * sz + y * sz + x] = val;
         }
     }
