@@ -3,8 +3,11 @@ mod overlay;
 use eframe::egui;
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 use pix_sense_common::{
-    decode_frame_message, DetectionAlgo, DetectionConfig, FaceDetection, StreamSelection,
+    decode_frame_message, CalibrationPoint, CameraExtrinsics, DetectionAlgo, DetectionConfig,
+    FaceDetection, LedPoint, StreamSelection, TrackingPoint,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -48,6 +51,12 @@ fn get_ws_url() -> String {
     format!("{}//{}/ws", ws_protocol, host)
 }
 
+#[derive(PartialEq, Clone)]
+enum ViewMode {
+    Cameras,
+    Scene,
+}
+
 struct App {
     ws_sender: WsSender,
     ws_receiver: WsReceiver,
@@ -65,6 +74,39 @@ struct App {
     local_config: DetectionConfig,
     /// Config the server reports as active (echoed back in FrameMetadata).
     active_config: DetectionConfig,
+    // 3D scene data
+    leds: Vec<LedPoint>,
+    tracking: Vec<TrackingPoint>,
+    /// Populated once by the /api/leds fetch; None until the response arrives.
+    led_pending: Rc<RefCell<Option<Vec<LedPoint>>>>,
+    // 3D orbit camera state
+    scene_yaw: f32,
+    scene_pitch: f32,
+    scene_zoom: f32,
+    // View state
+    view_mode: ViewMode,
+    locked_location: Option<String>,
+    // Calibration state
+    calib_mode: bool,
+    /// Point pairs collected so far (mirrors server-side list for this session).
+    calib_points: Vec<CalibrationPoint>,
+    /// World-frame XYZ typed by the user (pending pairing with a cam point).
+    calib_world_input: [String; 3],
+    /// Camera-frame point captured by clicking a tracking dot.
+    calib_pending_cam: Option<[f32; 3]>,
+    /// Current extrinsics (None = identity / uncalibrated).
+    extrinsics: Option<CameraExtrinsics>,
+    /// Camera serial number fetched from server.
+    camera_id: String,
+    // Async fetch pending cells (same pattern as led_pending)
+    extrinsics_pending: Rc<RefCell<Option<Option<CameraExtrinsics>>>>,
+    points_pending: Rc<RefCell<Option<Vec<CalibrationPoint>>>>,
+    camera_id_pending: Rc<RefCell<Option<String>>>,
+    // Manual extrinsics editor state
+    /// Translation in metres, synced to/from `extrinsics.t`.
+    manual_t: [f32; 3],
+    /// Euler XYZ rotation angles in degrees (R = Rz·Ry·Rx), synced to/from `extrinsics.r`.
+    manual_euler_deg: [f32; 3],
 }
 
 struct FpsCounter {
@@ -108,6 +150,64 @@ impl App {
             ewebsock::connect(&ws_url, ewebsock::Options::default())
                 .expect("Failed to connect WebSocket");
 
+        // Fetch LED positions once at startup.
+        // Uses Rc<RefCell<...>> (not std::sync::mpsc) since spawn_local is single-threaded WASM.
+        let led_pending: Rc<RefCell<Option<Vec<LedPoint>>>> = Rc::new(RefCell::new(None));
+        let led_pending_clone = led_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get("/api/leds").send().await {
+                if let Ok(leds) = resp.json::<Vec<LedPoint>>().await {
+                    *led_pending_clone.borrow_mut() = Some(leds);
+                }
+            }
+        });
+
+        // Fetch camera serial number.
+        let camera_id_pending: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let cid_clone = camera_id_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get("/api/calibration/camera_id")
+                .send()
+                .await
+            {
+                if let Ok(text) = resp.text().await {
+                    *cid_clone.borrow_mut() = Some(text);
+                }
+            }
+        });
+
+        // Fetch existing extrinsics (204 = none stored).
+        let extrinsics_pending: Rc<RefCell<Option<Option<CameraExtrinsics>>>> =
+            Rc::new(RefCell::new(None));
+        let ext_clone = extrinsics_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get("/api/calibration/extrinsics")
+                .send()
+                .await
+            {
+                if resp.status() == 204 {
+                    *ext_clone.borrow_mut() = Some(None);
+                } else if let Ok(ext) = resp.json::<CameraExtrinsics>().await {
+                    *ext_clone.borrow_mut() = Some(Some(ext));
+                }
+            }
+        });
+
+        // Fetch calibration points collected in a previous session on the server.
+        let points_pending: Rc<RefCell<Option<Vec<CalibrationPoint>>>> =
+            Rc::new(RefCell::new(None));
+        let pts_clone = points_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get("/api/calibration/points")
+                .send()
+                .await
+            {
+                if let Ok(pts) = resp.json::<Vec<CalibrationPoint>>().await {
+                    *pts_clone.borrow_mut() = Some(pts);
+                }
+            }
+        });
+
         Self {
             ws_sender,
             ws_receiver,
@@ -123,6 +223,25 @@ impl App {
             connected: false,
             local_config: DetectionConfig::default(),
             active_config: DetectionConfig::default(),
+            leds: Vec::new(),
+            tracking: Vec::new(),
+            led_pending,
+            scene_yaw: 0.3,
+            scene_pitch: -0.4,
+            scene_zoom: 5.0,
+            view_mode: ViewMode::Cameras,
+            locked_location: None,
+            calib_mode: false,
+            calib_points: Vec::new(),
+            calib_world_input: [String::new(), String::new(), String::new()],
+            calib_pending_cam: None,
+            extrinsics: None,
+            camera_id: String::new(),
+            extrinsics_pending,
+            points_pending,
+            camera_id_pending,
+            manual_t: [0.0; 3],
+            manual_euler_deg: [0.0; 3],
         }
     }
 
@@ -189,6 +308,34 @@ impl App {
             self.ws_sender.send(WsMessage::Text(json));
         }
     }
+}
+
+/// Build a rotation matrix from Euler XYZ angles (degrees).
+/// Convention: R = Rz · Ry · Rx  (extrinsic rotations: X first, then Y, then Z).
+fn euler_to_rotation(rx_deg: f32, ry_deg: f32, rz_deg: f32) -> [[f32; 3]; 3] {
+    let (rx, ry, rz) = (rx_deg.to_radians(), ry_deg.to_radians(), rz_deg.to_radians());
+    let (sx, cx) = (rx.sin(), rx.cos());
+    let (sy, cy) = (ry.sin(), ry.cos());
+    let (sz, cz) = (rz.sin(), rz.cos());
+    [
+        [ cy*cz,  cz*sx*sy - cx*sz,  cx*cz*sy + sx*sz],
+        [ cy*sz,  cx*cz + sx*sy*sz,  cx*sy*sz - cz*sx],
+        [-sy,     cy*sx,              cx*cy            ],
+    ]
+}
+
+/// Extract Euler XYZ angles (degrees) from a rotation matrix (R = Rz·Ry·Rx).
+fn rotation_to_euler_deg(r: &[[f32; 3]; 3]) -> [f32; 3] {
+    let sy = -r[2][0];
+    let ry = sy.clamp(-1.0, 1.0).asin();
+    let cy = ry.cos();
+    let (rx, rz) = if cy.abs() > 1e-6 {
+        (r[2][1].atan2(r[2][2]), r[1][0].atan2(r[0][0]))
+    } else {
+        // Gimbal lock — fold everything into Rx
+        (r[0][1].atan2(r[1][1]), 0.0)
+    };
+    [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()]
 }
 
 fn algo_label(algo: DetectionAlgo) -> &'static str {
@@ -271,7 +418,26 @@ fn depth_colormap(v: u8) -> egui::Color32 {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Poll WebSocket for new frames
+        // Drain LED fetch result (arrives once after startup)
+        if let Some(leds) = self.led_pending.borrow_mut().take() {
+            self.leds = leds;
+        }
+        // Drain calibration fetch results
+        if let Some(id) = self.camera_id_pending.borrow_mut().take() {
+            self.camera_id = id;
+        }
+        if let Some(maybe_ext) = self.extrinsics_pending.borrow_mut().take() {
+            self.extrinsics = maybe_ext;
+            if let Some(ref ext) = self.extrinsics {
+                self.manual_t = ext.t;
+                self.manual_euler_deg = rotation_to_euler_deg(&ext.r);
+            }
+        }
+        if let Some(pts) = self.points_pending.borrow_mut().take() {
+            self.calib_points = pts;
+        }
+
+        // Poll WebSocket for new frames and tracking updates
         while let Some(event) = self.ws_receiver.try_recv() {
             match event {
                 WsEvent::Opened => {
@@ -281,6 +447,12 @@ impl eframe::App for App {
                 }
                 WsEvent::Message(WsMessage::Binary(data)) => {
                     self.handle_binary_message(ctx, &data);
+                }
+                WsEvent::Message(WsMessage::Text(text)) => {
+                    // Server sends tracking_locations as a JSON array of TrackingPoint
+                    if let Ok(pts) = serde_json::from_str::<Vec<TrackingPoint>>(&text) {
+                        self.tracking = pts;
+                    }
                 }
                 WsEvent::Error(e) => {
                     tracing::warn!("WebSocket error: {}", e);
@@ -374,113 +546,666 @@ impl eframe::App for App {
                     );
                 }
             });
+
+            ui.horizontal(|ui| {
+                // View toggle
+                ui.selectable_value(&mut self.view_mode, ViewMode::Cameras, "Cameras");
+                ui.selectable_value(&mut self.view_mode, ViewMode::Scene, "3D Scene");
+
+                // Location lock (only relevant in Scene mode)
+                if self.view_mode == ViewMode::Scene && !self.tracking.is_empty() {
+                    ui.separator();
+                    ui.label("Lock to:");
+
+                    let selected_label = match &self.locked_location {
+                        Some(name) => name.chars().take(8).collect::<String>(),
+                        None => "Free".to_string(),
+                    };
+
+                    egui::ComboBox::from_id_salt("location_lock")
+                        .selected_text(selected_label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.locked_location, None, "Free");
+                            let names: Vec<String> =
+                                self.tracking.iter().map(|p| p.name.clone()).collect();
+                            for name in names {
+                                let label = name.chars().take(8).collect::<String>();
+                                ui.selectable_value(
+                                    &mut self.locked_location,
+                                    Some(name.clone()),
+                                    label,
+                                );
+                            }
+                        });
+                } else if self.view_mode == ViewMode::Cameras {
+                    // Clear lock when switching away from scene view
+                    self.locked_location = None;
+                }
+            });
         });
 
-        // Central panel with camera feeds
+        // Central panel — show either camera feeds or 3D scene
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let available = ui.available_size();
-                let panel_width = (available.x - 20.0) / 3.0; // 3 feeds with separators
+            match self.view_mode {
+                ViewMode::Cameras => {
+                    ui.horizontal(|ui| {
+                        let available = ui.available_size();
+                        let panel_width = (available.x - 20.0) / 3.0; // 3 feeds with separators
 
-                // RGB feed with face overlay
-                ui.vertical(|ui| {
-                    ui.label("RGB + Face");
-                    if let Some(tex) = &self.rgb_texture {
-                        let aspect = self.rgb_size[1] as f32 / self.rgb_size[0] as f32;
-                        let display_h = panel_width * aspect;
-                        let display_size = egui::vec2(panel_width, display_h);
+                        // RGB feed with face overlay
+                        ui.vertical(|ui| {
+                            ui.label("RGB + Face");
+                            if let Some(tex) = &self.rgb_texture {
+                                let aspect = self.rgb_size[1] as f32 / self.rgb_size[0] as f32;
+                                let display_h = panel_width * aspect;
+                                let display_size = egui::vec2(panel_width, display_h);
 
-                        let (rect, _response) =
-                            ui.allocate_exact_size(display_size, egui::Sense::hover());
+                                let (rect, _response) =
+                                    ui.allocate_exact_size(display_size, egui::Sense::hover());
 
-                        ui.painter().image(
-                            tex.id(),
-                            rect,
-                            egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            ),
-                            egui::Color32::WHITE,
-                        );
+                                ui.painter().image(
+                                    tex.id(),
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
 
-                        let scale_x = rect.width() / self.rgb_size[0] as f32;
-                        let scale_y = rect.height() / self.rgb_size[1] as f32;
-                        overlay::draw_faces(
-                            ui.painter(),
-                            &self.latest_rgb_faces,
-                            rect.left_top(),
-                            scale_x,
-                            scale_y,
-                        );
+                                let scale_x = rect.width() / self.rgb_size[0] as f32;
+                                let scale_y = rect.height() / self.rgb_size[1] as f32;
+                                overlay::draw_faces(
+                                    ui.painter(),
+                                    &self.latest_rgb_faces,
+                                    rect.left_top(),
+                                    scale_x,
+                                    scale_y,
+                                );
+                            } else {
+                                ui.label("Waiting for camera...");
+                            }
+                        });
+
+                        ui.separator();
+
+                        // IR feed with face overlay
+                        ui.vertical(|ui| {
+                            ui.label("IR + Face");
+                            if let Some(tex) = &self.ir_texture {
+                                let aspect = self.ir_size[1] as f32 / self.ir_size[0] as f32;
+                                let display_h = panel_width * aspect;
+                                let display_size = egui::vec2(panel_width, display_h);
+
+                                let (rect, _response) =
+                                    ui.allocate_exact_size(display_size, egui::Sense::hover());
+
+                                ui.painter().image(
+                                    tex.id(),
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+
+                                let scale_x = rect.width() / self.ir_size[0] as f32;
+                                let scale_y = rect.height() / self.ir_size[1] as f32;
+                                overlay::draw_faces(
+                                    ui.painter(),
+                                    &self.latest_ir_faces,
+                                    rect.left_top(),
+                                    scale_x,
+                                    scale_y,
+                                );
+                            } else {
+                                ui.label("Waiting for camera...");
+                            }
+                        });
+
+                        ui.separator();
+
+                        // Depth feed
+                        ui.vertical(|ui| {
+                            ui.label("Depth");
+                            if let Some(tex) = &self.depth_texture {
+                                let aspect = self.depth_size[1] as f32 / self.depth_size[0] as f32;
+                                let display_h = panel_width * aspect;
+                                let display_size = egui::vec2(panel_width, display_h);
+
+                                let (rect, _response) =
+                                    ui.allocate_exact_size(display_size, egui::Sense::hover());
+
+                                ui.painter().image(
+                                    tex.id(),
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            } else {
+                                ui.label("Waiting for camera...");
+                            }
+                        });
+                    });
+                }
+
+                ViewMode::Scene => {
+                    // ── Calibration side panel ────────────────────────────────
+                    egui::SidePanel::right("calib_panel")
+                        .resizable(false)
+                        .default_width(210.0)
+                        .show_inside(ui, |ui| {
+                            ui.heading("Calibration");
+                            let cam_label = if self.camera_id.is_empty() {
+                                "…".to_string()
+                            } else {
+                                self.camera_id.clone()
+                            };
+                            ui.small(format!("Camera: {}", cam_label));
+                            ui.separator();
+
+                            ui.checkbox(&mut self.calib_mode, "Calibration mode");
+                            if self.calib_mode {
+                                ui.colored_label(
+                                    egui::Color32::YELLOW,
+                                    "Click a tracking point\nin the scene to capture it",
+                                );
+                            }
+
+                            ui.separator();
+
+                            // Status
+                            if self.extrinsics.is_some() {
+                                ui.colored_label(egui::Color32::GREEN, "Extrinsics active");
+                            } else {
+                                ui.colored_label(egui::Color32::from_gray(160), "Uncalibrated");
+                            }
+
+                            ui.add_space(4.0);
+                            ui.label(format!("{} pair(s) collected", self.calib_points.len()));
+
+                            ui.separator();
+                            ui.label("World XYZ (metres):");
+                            ui.horizontal(|ui| {
+                                for (hint, val) in ["X", "Y", "Z"]
+                                    .iter()
+                                    .zip(self.calib_world_input.iter_mut())
+                                {
+                                    ui.add(
+                                        egui::TextEdit::singleline(val)
+                                            .hint_text(*hint)
+                                            .desired_width(52.0),
+                                    );
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            if let Some(cam) = self.calib_pending_cam {
+                                ui.label(format!(
+                                    "Cam: ({:.3}, {:.3}, {:.3})",
+                                    cam[0], cam[1], cam[2]
+                                ));
+
+                                let can_add = self.calib_world_input.iter().all(|s| {
+                                    s.trim().parse::<f32>().is_ok()
+                                });
+                                if ui
+                                    .add_enabled(can_add, egui::Button::new("Add pair"))
+                                    .clicked()
+                                {
+                                    let wx =
+                                        self.calib_world_input[0].trim().parse::<f32>().unwrap();
+                                    let wy =
+                                        self.calib_world_input[1].trim().parse::<f32>().unwrap();
+                                    let wz =
+                                        self.calib_world_input[2].trim().parse::<f32>().unwrap();
+                                    let pt = CalibrationPoint {
+                                        cam,
+                                        world: [wx, wy, wz],
+                                    };
+                                    self.calib_points.push(pt);
+                                    self.calib_pending_cam = None;
+                                    // POST to server (fire-and-forget)
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        let _ = gloo_net::http::Request::post(
+                                            "/api/calibration/points",
+                                        )
+                                        .json(&pt)
+                                        .expect("serialize CalibrationPoint")
+                                        .send()
+                                        .await;
+                                    });
+                                }
+                                if ui.small_button("Cancel").clicked() {
+                                    self.calib_pending_cam = None;
+                                }
+                            } else {
+                                ui.colored_label(
+                                    egui::Color32::from_gray(140),
+                                    "No cam point selected",
+                                );
+                            }
+
+                            ui.separator();
+
+                            let can_compute = self.calib_points.len() >= 3;
+                            if ui
+                                .add_enabled(can_compute, egui::Button::new("Compute extrinsics"))
+                                .clicked()
+                            {
+                                let ext_pending = self.extrinsics_pending.clone();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if let Ok(resp) =
+                                        gloo_net::http::Request::post("/api/calibration/compute")
+                                            .send()
+                                            .await
+                                    {
+                                        if let Ok(ext) =
+                                            resp.json::<CameraExtrinsics>().await
+                                        {
+                                            *ext_pending.borrow_mut() = Some(Some(ext));
+                                        }
+                                    }
+                                });
+                            }
+
+                            if ui.button("Clear pairs").clicked() {
+                                self.calib_points.clear();
+                                self.calib_pending_cam = None;
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    let _ = gloo_net::http::Request::delete(
+                                        "/api/calibration/points",
+                                    )
+                                    .send()
+                                    .await;
+                                });
+                            }
+
+                            if self.extrinsics.is_some()
+                                && ui.button("Clear extrinsics").clicked()
+                            {
+                                self.extrinsics = None;
+                                self.manual_t = [0.0; 3];
+                                self.manual_euler_deg = [0.0; 3];
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    let _ = gloo_net::http::Request::delete(
+                                        "/api/calibration/extrinsics",
+                                    )
+                                    .send()
+                                    .await;
+                                });
+                            }
+
+                            // ── Manual adjust ────────────────────────────────
+                            ui.separator();
+                            ui.label("Manual adjust:");
+
+                            ui.label("Translation (m):");
+                            let mut t_changed = false;
+                            ui.horizontal(|ui| {
+                                t_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.manual_t[0])
+                                            .speed(0.005)
+                                            .prefix("X: ")
+                                            .fixed_decimals(3),
+                                    )
+                                    .changed();
+                                t_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.manual_t[1])
+                                            .speed(0.005)
+                                            .prefix("Y: ")
+                                            .fixed_decimals(3),
+                                    )
+                                    .changed();
+                                t_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.manual_t[2])
+                                            .speed(0.005)
+                                            .prefix("Z: ")
+                                            .fixed_decimals(3),
+                                    )
+                                    .changed();
+                            });
+
+                            ui.label("Rotation (°):");
+                            let mut r_changed = false;
+                            ui.horizontal(|ui| {
+                                r_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.manual_euler_deg[0])
+                                            .speed(0.2)
+                                            .prefix("X: ")
+                                            .fixed_decimals(1),
+                                    )
+                                    .changed();
+                                r_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.manual_euler_deg[1])
+                                            .speed(0.2)
+                                            .prefix("Y: ")
+                                            .fixed_decimals(1),
+                                    )
+                                    .changed();
+                                r_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.manual_euler_deg[2])
+                                            .speed(0.2)
+                                            .prefix("Z: ")
+                                            .fixed_decimals(1),
+                                    )
+                                    .changed();
+                            });
+
+                            if t_changed || r_changed {
+                                let r = euler_to_rotation(
+                                    self.manual_euler_deg[0],
+                                    self.manual_euler_deg[1],
+                                    self.manual_euler_deg[2],
+                                );
+                                let new_ext = CameraExtrinsics { r, t: self.manual_t };
+                                self.extrinsics = Some(new_ext);
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    let _ = gloo_net::http::Request::put(
+                                        "/api/calibration/extrinsics",
+                                    )
+                                    .json(&new_ext)
+                                    .expect("serialize CameraExtrinsics")
+                                    .send()
+                                    .await;
+                                });
+                            }
+                        });
+
+                    // ── 3D scatter view ────────────────────────────────────────
+                    // Apply locked-location camera before handling user input
+                    let is_locked = if let Some(ref locked_name) = self.locked_location.clone() {
+                        if let Some(pt) =
+                            self.tracking.iter().find(|p| &p.name == locked_name)
+                        {
+                            let dx = pt.x;
+                            let dy = pt.y;
+                            let dz = pt.z;
+                            // Point camera from the tracked location toward the origin.
+                            // Camera world pos = (dist·cos(p)·sin(y), dist·sin(p), -dist·cos(p)·cos(y))
+                            // → sin(y) = dx/r_xz, cos(y) = -dz/r_xz  ⇒  yaw = atan2(dx, -dz)
+                            // → sin(p) = dy/dist                       ⇒  pitch = atan2(dy, r_xz)
+                            self.scene_yaw = dx.atan2(-dz);
+                            self.scene_pitch =
+                                dy.atan2((dx * dx + dz * dz).sqrt());
+                            self.scene_zoom =
+                                (dx * dx + dy * dy + dz * dz).sqrt().max(0.5);
+                            true
+                        } else {
+                            false
+                        }
                     } else {
-                        ui.label("Waiting for camera...");
-                    }
-                });
+                        false
+                    };
 
-                ui.separator();
-
-                // IR feed with face overlay
-                ui.vertical(|ui| {
-                    ui.label("IR + Face");
-                    if let Some(tex) = &self.ir_texture {
-                        let aspect = self.ir_size[1] as f32 / self.ir_size[0] as f32;
-                        let display_h = panel_width * aspect;
-                        let display_size = egui::vec2(panel_width, display_h);
-
-                        let (rect, _response) =
-                            ui.allocate_exact_size(display_size, egui::Sense::hover());
-
-                        ui.painter().image(
-                            tex.id(),
-                            rect,
-                            egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            ),
-                            egui::Color32::WHITE,
-                        );
-
-                        let scale_x = rect.width() / self.ir_size[0] as f32;
-                        let scale_y = rect.height() / self.ir_size[1] as f32;
-                        overlay::draw_faces(
-                            ui.painter(),
-                            &self.latest_ir_faces,
-                            rect.left_top(),
-                            scale_x,
-                            scale_y,
-                        );
+                    let view_height = (ui.available_height() - 4.0).max(160.0);
+                    let sense = if is_locked {
+                        egui::Sense::hover()
                     } else {
-                        ui.label("Waiting for camera...");
+                        egui::Sense::click_and_drag()
+                    };
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), view_height),
+                        sense,
+                    );
+
+                    // Orbit on drag (free mode only)
+                    if !is_locked && response.dragged() {
+                        let d = response.drag_delta();
+                        self.scene_yaw += d.x * 0.005;
+                        self.scene_pitch =
+                            (self.scene_pitch + d.y * 0.005).clamp(-1.5, 1.5);
                     }
-                });
+                    // Zoom on scroll (free mode only)
+                    if !is_locked && response.hovered() {
+                        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                        self.scene_zoom =
+                            (self.scene_zoom - scroll * 0.01).clamp(0.5, 20.0);
+                    }
 
-                ui.separator();
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(15, 15, 25));
 
-                // Depth feed
-                ui.vertical(|ui| {
-                    ui.label("Depth");
-                    if let Some(tex) = &self.depth_texture {
-                        let aspect = self.depth_size[1] as f32 / self.depth_size[0] as f32;
-                        let display_h = panel_width * aspect;
-                        let display_size = egui::vec2(panel_width, display_h);
-
-                        let (rect, _response) =
-                            ui.allocate_exact_size(display_size, egui::Sense::hover());
-
-                        ui.painter().image(
-                            tex.id(),
-                            rect,
-                            egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            ),
-                            egui::Color32::WHITE,
-                        );
+                    let hint = if self.calib_mode {
+                        "3D View  (calibration mode — click a tracking point)"
+                    } else if is_locked {
+                        "3D View  (locked to location)"
                     } else {
-                        ui.label("Waiting for camera...");
+                        "3D View  (drag = orbit  |  scroll = zoom)"
+                    };
+                    painter.text(
+                        rect.left_top() + egui::vec2(6.0, 4.0),
+                        egui::Align2::LEFT_TOP,
+                        hint,
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(100),
+                    );
+
+                    // Perspective projection.
+                    // Camera frame: X=right, Y=down, Z=forward (metres).
+                    // 1. Yaw rotates around Y axis.
+                    // 2. Pitch rotates around X axis.
+                    // 3. Y is flipped so up is up on screen.
+                    let cx = rect.center().x;
+                    let cy = rect.center().y;
+                    let scale = 500.0_f32; // pixels per metre
+                    let (yaw, pitch, dist) =
+                        (self.scene_yaw, self.scene_pitch, self.scene_zoom);
+
+                    let project = |px: f32, py: f32, pz: f32| -> Option<egui::Pos2> {
+                        // Yaw (around Y)
+                        let (sy, cy_) = (yaw.sin(), yaw.cos());
+                        let rx = px * cy_ + pz * sy;
+                        let ry = -py; // flip camera Y-down → display Y-up
+                        let rz = -px * sy + pz * cy_;
+                        // Pitch (around X)
+                        let (sp, cp) = (pitch.sin(), pitch.cos());
+                        let fx = rx;
+                        let fy = ry * cp - rz * sp;
+                        let fz = ry * sp + rz * cp;
+                        // Perspective divide
+                        let w = fz + dist;
+                        if w < 0.01 {
+                            return None;
+                        }
+                        Some(egui::pos2(cx + scale * fx / w, cy - scale * fy / w))
+                    };
+
+                    // LEDs — small gray dots
+                    for led in &self.leds {
+                        if let Some(p) = project(led.x, led.y, led.z) {
+                            if rect.contains(p) {
+                                painter.circle_filled(p, 2.0, egui::Color32::from_gray(160));
+                            }
+                        }
                     }
-                });
-            });
+
+                    // Tracking locations — larger cyan dots with short UUID label
+                    for tp in &self.tracking {
+                        let is_locked_tp = self
+                            .locked_location
+                            .as_deref()
+                            .map(|n| n == tp.name)
+                            .unwrap_or(false);
+                        let is_pending = self
+                            .calib_pending_cam
+                            .map(|p| p[0] == tp.x && p[1] == tp.y && p[2] == tp.z)
+                            .unwrap_or(false);
+                        if let Some(p) = project(tp.x, tp.y, tp.z) {
+                            if rect.contains(p) {
+                                let color = if is_pending {
+                                    egui::Color32::from_rgb(255, 100, 255)
+                                } else if is_locked_tp {
+                                    egui::Color32::from_rgb(255, 180, 0)
+                                } else {
+                                    egui::Color32::from_rgb(0, 220, 180)
+                                };
+                                painter.circle_filled(p, 6.0, color);
+                                painter.circle_stroke(
+                                    p,
+                                    6.0,
+                                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                                );
+                                let short_name: String = tp.name.chars().take(8).collect();
+                                painter.text(
+                                    p + egui::vec2(9.0, -6.0),
+                                    egui::Align2::LEFT_TOP,
+                                    &short_name,
+                                    egui::FontId::monospace(9.0),
+                                    color,
+                                );
+                            }
+                        }
+                    }
+
+                    // Camera position, orientation axes, and frustum — always shown.
+                    // When no extrinsics: camera sits at the origin with identity rotation.
+                    let cam_t = self.extrinsics.as_ref().map(|e| e.t).unwrap_or([0.0, 0.0, 0.0]);
+                    let cam_r = self.extrinsics.as_ref().map(|e| e.r).unwrap_or([
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ]);
+                    let [tx, ty, tz] = cam_t;
+                    // Transform a camera-local point into world frame: p_world = R * p_cam + t
+                    let cam_to_world = |p: [f32; 3]| -> [f32; 3] {
+                        [
+                            cam_r[0][0] * p[0] + cam_r[0][1] * p[1] + cam_r[0][2] * p[2] + tx,
+                            cam_r[1][0] * p[0] + cam_r[1][1] * p[1] + cam_r[1][2] * p[2] + ty,
+                            cam_r[2][0] * p[0] + cam_r[2][1] * p[1] + cam_r[2][2] * p[2] + tz,
+                        ]
+                    };
+                    if let Some(origin_px) = project(tx, ty, tz) {
+                        let axis_len: f32 = 0.3; // metres
+                        // Column j of R gives the world-frame direction of camera local axis j.
+                        // X axis (red)
+                        let x_tip = [
+                            tx + cam_r[0][0] * axis_len,
+                            ty + cam_r[1][0] * axis_len,
+                            tz + cam_r[2][0] * axis_len,
+                        ];
+                        if let Some(tip) = project(x_tip[0], x_tip[1], x_tip[2]) {
+                            painter.line_segment(
+                                [origin_px, tip],
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 60)),
+                            );
+                        }
+                        // Y axis (green)
+                        let y_tip = [
+                            tx + cam_r[0][1] * axis_len,
+                            ty + cam_r[1][1] * axis_len,
+                            tz + cam_r[2][1] * axis_len,
+                        ];
+                        if let Some(tip) = project(y_tip[0], y_tip[1], y_tip[2]) {
+                            painter.line_segment(
+                                [origin_px, tip],
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 220, 60)),
+                            );
+                        }
+                        // Z axis / look direction (blue)
+                        let z_tip = [
+                            tx + cam_r[0][2] * axis_len,
+                            ty + cam_r[1][2] * axis_len,
+                            tz + cam_r[2][2] * axis_len,
+                        ];
+                        if let Some(tip) = project(z_tip[0], z_tip[1], z_tip[2]) {
+                            painter.line_segment(
+                                [origin_px, tip],
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 100, 255)),
+                            );
+                        }
+
+                        // Frustum — D435 at 640×480: fx≈615, fy≈615
+                        // tan(half_fov_h) = 320/615 ≈ 0.520
+                        // tan(half_fov_v) = 240/615 ≈ 0.390
+                        let frust_depth: f32 = 2.0; // metres to far plane
+                        let hx = 0.520 * frust_depth;
+                        let hy = 0.390 * frust_depth;
+                        // Corners in camera-local frame (X right, Y down, Z forward)
+                        let corners_cam: [[f32; 3]; 4] = [
+                            [ hx,  hy, frust_depth], // bottom-right
+                            [ hx, -hy, frust_depth], // top-right
+                            [-hx, -hy, frust_depth], // top-left
+                            [-hx,  hy, frust_depth], // bottom-left
+                        ];
+                        let frust_color =
+                            egui::Color32::from_rgba_unmultiplied(120, 190, 255, 90);
+                        let frust_stroke = egui::Stroke::new(1.0, frust_color);
+                        let corners_px: Vec<Option<egui::Pos2>> = corners_cam
+                            .iter()
+                            .map(|&c| {
+                                let w = cam_to_world(c);
+                                project(w[0], w[1], w[2])
+                            })
+                            .collect();
+                        // 4 rays: origin → corner
+                        for &cp in &corners_px {
+                            if let Some(cp) = cp {
+                                painter.line_segment([origin_px, cp], frust_stroke);
+                            }
+                        }
+                        // Far-plane rectangle: 0-1-2-3-0
+                        for i in 0..4 {
+                            if let (Some(a), Some(b)) =
+                                (corners_px[i], corners_px[(i + 1) % 4])
+                            {
+                                painter.line_segment([a, b], frust_stroke);
+                            }
+                        }
+
+                        // Origin dot + label
+                        let cam_dot_color = if self.extrinsics.is_some() {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::from_gray(180)
+                        };
+                        painter.circle_filled(origin_px, 5.0, cam_dot_color);
+                        painter.text(
+                            origin_px + egui::vec2(7.0, -7.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            "CAM",
+                            egui::FontId::monospace(9.0),
+                            cam_dot_color,
+                        );
+                    }
+
+                    // Calibration: capture a tracking point on click
+                    if self.calib_mode && response.clicked() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            for tp in &self.tracking {
+                                if let Some(p) = project(tp.x, tp.y, tp.z) {
+                                    if (p - pos).length() < 12.0 {
+                                        self.calib_pending_cam = Some([tp.x, tp.y, tp.z]);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    painter.text(
+                        rect.left_bottom() + egui::vec2(6.0, -4.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!(
+                            "LEDs: {}  |  Tracking: {}",
+                            self.leds.len(),
+                            self.tracking.len()
+                        ),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(100),
+                    );
+                }
+            }
         });
 
         // Request continuous repaint for live video

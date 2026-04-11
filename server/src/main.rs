@@ -1,8 +1,9 @@
 mod camera;
+mod db;
 mod face;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use axum::{
@@ -10,15 +11,18 @@ use axum::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
+    http::StatusCode,
     response::IntoResponse,
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use image::RgbImage;
 use pix_sense_common::{
-    encode_frame_message, DetectionConfig, FaceDetection, FrameMetadata,
+    encode_frame_message, CalibrationPoint, CameraExtrinsics, DetectionConfig, FaceDetection,
+    FrameMetadata, LedPoint, TrackingPoint,
 };
-use tokio::sync::watch;
+use sqlx::{PgPool, Row as _};
+use tokio::sync::{broadcast, watch};
 use tower_http::services::ServeDir;
 
 use camera::{Camera, CameraIntrinsics};
@@ -42,6 +46,14 @@ struct FrameData {
 struct AppState {
     frame_rx: watch::Receiver<Arc<Vec<u8>>>,
     config: Arc<RwLock<DetectionConfig>>,
+    db_pool: Option<PgPool>,
+    tracking_tx: broadcast::Sender<String>,
+    /// Current camera extrinsics (applied to all depth detections). None = identity (camera at origin).
+    extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
+    /// Calibration point pairs collected in this session (in-memory, not persisted).
+    calib_points: Arc<Mutex<Vec<CalibrationPoint>>>,
+    /// RealSense serial number — used as the DB key for extrinsics.
+    camera_id: Arc<String>,
 }
 
 #[tokio::main]
@@ -59,23 +71,112 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(RwLock::new(DetectionConfig::default()));
 
+    // Query camera serial number before starting the full pipeline.
+    let camera_id = Arc::new(
+        camera::query_serial().unwrap_or_else(|| {
+            tracing::warn!("Could not read camera serial — using 'unknown' as camera_id");
+            "unknown".to_string()
+        })
+    );
+    tracing::info!("Camera serial: {}", camera_id);
+
+    // Connect to postgres (optional — runs without DB if DATABASE_URL is unset)
+    let db_pool = db::connect().await;
+
     // Watch channel for broadcasting the latest encoded frame to all WebSocket clients
     let (frame_tx, frame_rx) = watch::channel(Arc::new(Vec::new()));
+
+    // Unbounded channel for sending XYZ detections to the async DB writer task.
+    // Unbounded so the sync detection thread never blocks on DB backpressure.
+    let (db_tx, mut db_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<[f32; 3]>>();
+
+    // Broadcast channel for pushing tracking_location updates to WebSocket clients.
+    let (tracking_tx, _) = broadcast::channel::<String>(16);
+
+    // Load extrinsics for this camera from DB; create and persist identity if none exist.
+    let identity = CameraExtrinsics {
+        r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        t: [0.0, 0.0, 0.0],
+    };
+    let initial_extrinsics = if let Some(pool) = &db_pool {
+        if let Some(ext) = db::load_extrinsics(pool, &camera_id).await {
+            tracing::info!("Loaded extrinsics for camera {}: t={:?}", camera_id, ext.t);
+            ext
+        } else {
+            tracing::info!(
+                "No extrinsics stored for camera {} — saving identity as default",
+                camera_id
+            );
+            if let Err(e) = db::save_extrinsics(pool, &camera_id, &identity).await {
+                tracing::warn!("Failed to save default extrinsics: {e:#}");
+            }
+            identity
+        }
+    } else {
+        identity
+    };
+    let extrinsics = Arc::new(RwLock::new(Some(initial_extrinsics)));
+
+    let calib_points: Arc<Mutex<Vec<CalibrationPoint>>> = Arc::new(Mutex::new(Vec::new()));
+
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     let config_clone = config.clone();
+    let extrinsics_clone = extrinsics.clone();
 
     // Spawn camera + face detection thread (blocking, runs on a std::thread)
     let handle = std::thread::spawn(move || {
-        if let Err(e) = processing_thread(frame_tx, &running_clone, config_clone) {
+        if let Err(e) = processing_thread(frame_tx, &running_clone, config_clone, db_tx, extrinsics_clone) {
             tracing::error!("Processing thread error: {:#}", e);
         }
     });
 
-    let state = AppState { frame_rx, config };
+    // Spawn async task that drains the XYZ channel and writes to postgres
+    if let Some(pool) = &db_pool {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            while let Some(xyzs) = db_rx.recv().await {
+                db::write_detections(&pool, &xyzs).await;
+            }
+        });
+    }
+
+    // Spawn PgListener task that forwards tracking_location NOTIFYs to WebSocket clients
+    if let Some(pool) = &db_pool {
+        let pool = pool.clone();
+        let tx = tracking_tx.clone();
+        tokio::spawn(async move {
+            tracking_listener(pool, tx).await;
+        });
+    }
+
+    let state = AppState {
+        frame_rx,
+        config,
+        db_pool,
+        tracking_tx,
+        extrinsics,
+        calib_points,
+        camera_id,
+    };
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/api/leds", get(leds_handler))
+        .route("/api/calibration/camera_id", get(camera_id_handler))
+        .route(
+            "/api/calibration/extrinsics",
+            get(get_extrinsics_handler)
+                .put(put_extrinsics_handler)
+                .delete(delete_extrinsics_handler),
+        )
+        .route(
+            "/api/calibration/points",
+            get(get_points_handler)
+                .post(add_point_handler)
+                .delete(clear_points_handler),
+        )
+        .route("/api/calibration/compute", post(compute_extrinsics_handler))
         .fallback_service(ServeDir::new("client/dist"))
         .with_state(state);
 
@@ -96,13 +197,15 @@ async fn ws_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     tracing::info!("New WebSocket connection");
-    ws.on_upgrade(|socket| handle_ws(socket, state.frame_rx, state.config))
+    let tracking_rx = state.tracking_tx.subscribe();
+    ws.on_upgrade(|socket| handle_ws(socket, state.frame_rx, state.config, tracking_rx))
 }
 
 async fn handle_ws(
     mut socket: WebSocket,
     mut rx: watch::Receiver<Arc<Vec<u8>>>,
     config: Arc<RwLock<DetectionConfig>>,
+    mut tracking_rx: broadcast::Receiver<String>,
 ) {
     loop {
         tokio::select! {
@@ -116,6 +219,12 @@ async fn handle_ws(
                     continue;
                 }
                 if socket.send(Message::Binary((*frame).clone().into())).await.is_err() {
+                    break; // client disconnected
+                }
+            }
+            // Tracking location update from DB LISTEN — forward as JSON text
+            Ok(json) = tracking_rx.recv() => {
+                if socket.send(Message::Text(json.into())).await.is_err() {
                     break; // client disconnected
                 }
             }
@@ -140,10 +249,249 @@ async fn handle_ws(
     tracing::info!("WebSocket client disconnected");
 }
 
+/// Listens for PostgreSQL NOTIFY on `tracking_location_update`, queries fresh rows,
+/// and broadcasts the JSON-encoded list to all connected WebSocket clients.
+async fn tracking_listener(pool: PgPool, tx: broadcast::Sender<String>) {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        tracing::warn!("DATABASE_URL not set, tracking_listener exiting");
+        return;
+    };
+    let mut listener = match sqlx::postgres::PgListener::connect(&database_url).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("PgListener connect failed: {:#}", e);
+            return;
+        }
+    };
+    if let Err(e) = listener.listen("tracking_location_update").await {
+        tracing::error!("PgListener listen failed: {:#}", e);
+        return;
+    }
+    tracing::info!("Listening for tracking_location_update notifications");
+
+    loop {
+        match listener.recv().await {
+            Ok(_notification) => {
+                let rows = sqlx::query(
+                    "SELECT name, x, y, z FROM tracking_locations \
+                     WHERE updated_at > now() - interval '1 second'",
+                )
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+
+                let points: Vec<TrackingPoint> = rows
+                    .into_iter()
+                    .map(|r| TrackingPoint {
+                        name: r.get("name"),
+                        x: r.get("x"),
+                        y: r.get("y"),
+                        z: r.get("z"),
+                    })
+                    .collect();
+
+                if let Ok(json) = serde_json::to_string(&points) {
+                    // Ignore error — no subscribers connected is fine
+                    let _ = tx.send(json);
+                }
+            }
+            Err(e) => {
+                // sqlx PgListener auto-reconnects on transient errors
+                tracing::warn!("PgListener error: {:#}", e);
+            }
+        }
+    }
+}
+
+async fn leds_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return Json(Vec::<LedPoint>::new());
+    };
+    let rows = sqlx::query("SELECT x, y, z FROM leds")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    Json(
+        rows.into_iter()
+            .map(|r| LedPoint {
+                x: r.get("x"),
+                y: r.get("y"),
+                z: r.get("z"),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Calibration route handlers
+// ---------------------------------------------------------------------------
+
+/// GET /api/calibration/camera_id — returns the camera serial number as plain text.
+async fn camera_id_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.camera_id.as_ref().clone()
+}
+
+/// GET /api/calibration/extrinsics — returns the current extrinsics as JSON, or 204 if none.
+async fn get_extrinsics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match *state.extrinsics.read().unwrap() {
+        Some(ext) => Json(ext).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// PUT /api/calibration/extrinsics — directly set extrinsics (e.g. from manual UI adjustment).
+async fn put_extrinsics_handler(
+    State(state): State<AppState>,
+    Json(ext): Json<CameraExtrinsics>,
+) -> impl IntoResponse {
+    *state.extrinsics.write().unwrap() = Some(ext);
+    if let Some(pool) = &state.db_pool {
+        if let Err(e) = db::save_extrinsics(pool, &state.camera_id, &ext).await {
+            tracing::warn!("Failed to persist extrinsics: {e:#}");
+        }
+    }
+    tracing::info!("Extrinsics updated for camera {}: t={:?}", state.camera_id, ext.t);
+    StatusCode::NO_CONTENT
+}
+
+/// DELETE /api/calibration/extrinsics — clears extrinsics from memory and DB.
+async fn delete_extrinsics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    *state.extrinsics.write().unwrap() = None;
+    if let Some(pool) = &state.db_pool {
+        if let Err(e) = db::clear_extrinsics(pool, &state.camera_id).await {
+            tracing::warn!("Failed to clear extrinsics from DB: {e:#}");
+        }
+    }
+    tracing::info!("Extrinsics cleared for camera {}", state.camera_id);
+    StatusCode::NO_CONTENT
+}
+
+/// GET /api/calibration/points — returns all accumulated calibration point pairs.
+async fn get_points_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let pts = state.calib_points.lock().unwrap().clone();
+    Json(pts)
+}
+
+/// POST /api/calibration/points — appends a calibration point pair.
+async fn add_point_handler(
+    State(state): State<AppState>,
+    Json(pt): Json<CalibrationPoint>,
+) -> impl IntoResponse {
+    let mut pts = state.calib_points.lock().unwrap();
+    pts.push(pt);
+    let count = pts.len();
+    tracing::info!(
+        "Calibration point added ({} total): cam={:?} world={:?}",
+        count, pt.cam, pt.world
+    );
+    Json(serde_json::json!({ "count": count }))
+}
+
+/// DELETE /api/calibration/points — clears all calibration point pairs.
+async fn clear_points_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.calib_points.lock().unwrap().clear();
+    tracing::info!("Calibration points cleared");
+    StatusCode::NO_CONTENT
+}
+
+/// POST /api/calibration/compute — runs Umeyama SVD on the collected point pairs,
+/// saves the result to memory and DB, and returns the computed extrinsics as JSON.
+/// Returns 400 if fewer than 3 point pairs are available.
+async fn compute_extrinsics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let pts = state.calib_points.lock().unwrap().clone();
+    if pts.len() < 3 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Need at least 3 calibration point pairs" })),
+        )
+            .into_response();
+    }
+
+    match compute_rigid_transform(&pts) {
+        Ok(ext) => {
+            tracing::info!(
+                "Computed extrinsics from {} pairs: t={:?}",
+                pts.len(), ext.t
+            );
+            *state.extrinsics.write().unwrap() = Some(ext);
+            if let Some(pool) = &state.db_pool {
+                if let Err(e) = db::save_extrinsics(pool, &state.camera_id, &ext).await {
+                    tracing::warn!("Failed to persist extrinsics: {e:#}");
+                }
+            }
+            Json(ext).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Umeyama rigid body registration (SVD)
+// ---------------------------------------------------------------------------
+
+/// Compute the optimal rigid body transform R, t such that p_world ≈ R * p_cam + t.
+///
+/// Uses the Kabsch/Umeyama SVD method. Requires ≥3 non-collinear point pairs.
+/// The det-correction step ensures R is a proper rotation (det = +1).
+fn compute_rigid_transform(pts: &[CalibrationPoint]) -> Result<CameraExtrinsics> {
+    use nalgebra::{Matrix3, SVD, Vector3};
+
+    let n = pts.len() as f64;
+
+    // Compute centroids
+    let mut cam_c = Vector3::zeros();
+    let mut world_c = Vector3::zeros();
+    for p in pts {
+        cam_c += Vector3::new(p.cam[0] as f64, p.cam[1] as f64, p.cam[2] as f64);
+        world_c += Vector3::new(p.world[0] as f64, p.world[1] as f64, p.world[2] as f64);
+    }
+    cam_c /= n;
+    world_c /= n;
+
+    // Cross-covariance matrix H = Σ (p_cam - c_cam) * (p_world - c_world)^T
+    let mut h = Matrix3::<f64>::zeros();
+    for p in pts {
+        let pc = Vector3::new(p.cam[0] as f64, p.cam[1] as f64, p.cam[2] as f64) - cam_c;
+        let pw = Vector3::new(p.world[0] as f64, p.world[1] as f64, p.world[2] as f64) - world_c;
+        h += pc * pw.transpose();
+    }
+
+    let svd = SVD::new(h, true, true);
+    let u = svd.u.ok_or_else(|| anyhow::anyhow!("SVD failed to converge (U)"))?;
+    let v_t = svd.v_t.ok_or_else(|| anyhow::anyhow!("SVD failed to converge (V)"))?;
+
+    // Ensure proper rotation: if det(V U^T) < 0, negate the last singular vector
+    let mut d = Matrix3::<f64>::identity();
+    if (v_t.transpose() * u.transpose()).determinant() < 0.0 {
+        d[(2, 2)] = -1.0;
+    }
+
+    // R = V * D * U^T
+    let r_mat = v_t.transpose() * d * u.transpose();
+
+    // t = c_world - R * c_cam
+    let t_vec = world_c - r_mat * cam_c;
+
+    let r = [
+        [r_mat[(0, 0)] as f32, r_mat[(0, 1)] as f32, r_mat[(0, 2)] as f32],
+        [r_mat[(1, 0)] as f32, r_mat[(1, 1)] as f32, r_mat[(1, 2)] as f32],
+        [r_mat[(2, 0)] as f32, r_mat[(2, 1)] as f32, r_mat[(2, 2)] as f32],
+    ];
+    let t = [t_vec[0] as f32, t_vec[1] as f32, t_vec[2] as f32];
+
+    Ok(CameraExtrinsics { r, t })
+}
+
 fn processing_thread(
     tx: watch::Sender<Arc<Vec<u8>>>,
     running: &AtomicBool,
     config: Arc<RwLock<DetectionConfig>>,
+    db_tx: tokio::sync::mpsc::UnboundedSender<Vec<[f32; 3]>>,
+    extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
 ) -> Result<()> {
     // Load models first — CUDA graph compilation can take a while,
     // and the RealSense pipeline may stall if frames aren't consumed.
@@ -197,7 +545,7 @@ fn processing_thread(
         );
 
         // Attach XYZ coordinates to every detection
-        let rgb_faces = rgb_faces_raw
+        let rgb_faces: Vec<_> = rgb_faces_raw
             .into_iter()
             .map(|mut f| {
                 f.xyz = compute_xyz(
@@ -211,7 +559,7 @@ fn processing_thread(
             })
             .collect();
 
-        let ir_faces = ir_faces_raw
+        let ir_faces: Vec<_> = ir_faces_raw
             .into_iter()
             .map(|mut f| {
                 f.xyz = compute_xyz(
@@ -224,6 +572,21 @@ fn processing_thread(
                 f
             })
             .collect();
+
+        // Send XYZ coordinates to the DB writer task (non-blocking).
+        // Apply camera extrinsics to convert from camera frame to world frame.
+        let xyzs: Vec<[f32; 3]> = {
+            let ext = extrinsics.read().unwrap();
+            rgb_faces
+                .iter()
+                .chain(ir_faces.iter())
+                .filter_map(|f| f.xyz)
+                .map(|p| ext.as_ref().map_or(p, |e| e.apply(p)))
+                .collect()
+        };
+        if !xyzs.is_empty() {
+            let _ = db_tx.send(xyzs);
+        }
 
         let data = FrameData {
             rgb: frames.rgb,

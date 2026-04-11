@@ -1,4 +1,16 @@
 services:
+  db:
+    image: postgres:16
+    container_name: pix-sense-db
+    environment:
+      POSTGRES_USER: pixpq
+      POSTGRES_PASSWORD: not_that_secret
+      POSTGRES_DB: pixpq
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
   dev:
     build: .
     container_name: pix-sense-dev
@@ -13,6 +25,12 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DATABASE_URL=${DATABASE_URL:-postgres://pixpq:not_that_secret@db:5432/pixpq}
+    depends_on:
+      - db
     stdin_open: true
     tty: true
     command: bash -c "ensure-model.sh && sleep infinity"
+
+volumes:
+  postgres_data:

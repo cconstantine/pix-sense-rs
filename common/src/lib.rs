@@ -75,6 +75,56 @@ pub struct FrameMetadata {
 ///   [u32 LE: depth_jpeg_len][depth_jpeg bytes]
 ///   [remaining bytes: JSON of FrameMetadata]
 
+/// A single LED physical position in camera-frame metres (X=right, Y=down, Z=forward).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LedPoint {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// A live tracking location from the `tracking_locations` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackingPoint {
+    pub name: String,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// Camera extrinsic transform: p_world = R * p_cam + t
+///
+/// R is a row-major 3×3 rotation matrix. The camera's origin in world coordinates is `t`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CameraExtrinsics {
+    /// Row-major 3×3 rotation matrix: r[row][col]
+    pub r: [[f32; 3]; 3],
+    /// Translation vector (metres, world frame). Camera origin in world = t.
+    pub t: [f32; 3],
+}
+
+impl CameraExtrinsics {
+    /// Transform a camera-frame point to a world-frame point.
+    #[inline]
+    pub fn apply(&self, p: [f32; 3]) -> [f32; 3] {
+        let r = &self.r;
+        [
+            r[0][0] * p[0] + r[0][1] * p[1] + r[0][2] * p[2] + self.t[0],
+            r[1][0] * p[0] + r[1][1] * p[1] + r[1][2] * p[2] + self.t[1],
+            r[2][0] * p[0] + r[2][1] * p[1] + r[2][2] * p[2] + self.t[2],
+        ]
+    }
+}
+
+/// A single point correspondence used for extrinsics calibration.
+/// `cam` is in camera frame (from the depth camera); `world` is the same physical
+/// point measured in the external reference frame.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CalibrationPoint {
+    pub cam: [f32; 3],
+    pub world: [f32; 3],
+}
+
 pub fn encode_frame_message(
     rgb_jpeg: &[u8],
     ir_jpeg: &[u8],

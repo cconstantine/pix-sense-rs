@@ -43,6 +43,21 @@ pub struct CameraFrames {
     pub intrinsics: CameraIntrinsics,
 }
 
+/// Query the serial number of the first connected RealSense device without
+/// starting the full pipeline. Returns `None` if no device is found.
+pub fn query_serial() -> Option<String> {
+    let context = RsContext::new().ok()?;
+    let devices = context.query_devices(HashSet::new());
+    let device = devices.first()?;
+    Some(
+        device
+            .info(Rs2CameraInfo::SerialNumber)
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 impl Camera {
     pub fn new() -> Result<Self> {
         let context = RsContext::new().context("Failed to create RealSense context")?;
