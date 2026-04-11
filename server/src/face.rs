@@ -4,6 +4,13 @@ use pix_sense_common::{FaceDetection, FaceLandmark};
 use std::ffi::{CStr, CString, c_char};
 use std::os::raw::c_int;
 use std::path::Path;
+use std::time::Instant;
+
+/// Timing breakdown from a single inference call (preprocess is measured by caller).
+pub struct InferTiming {
+    pub trt_infer_ms: f64,
+    pub postprocess_ms: f64,
+}
 
 const MODEL_INPUT_SIZE: u32 = 640;
 const CONF_THRESHOLD: f32 = 0.5;
@@ -25,6 +32,7 @@ extern "C" {
         onnx_path: *const c_char,
         cache_path: *const c_char,
         fp16: c_int,
+        input_size: c_int,
     ) -> *mut TrtEngine;
     fn trt_engine_destroy(engine: *mut TrtEngine);
     fn trt_engine_num_io(engine: *mut TrtEngine) -> i32;
@@ -78,14 +86,15 @@ impl Drop for FaceDetector {
 
 impl FaceDetector {
     pub fn new(model_path: &str) -> Result<Self> {
-        // Derive cache path from model path: models/foo.onnx -> models/foo.engine
-        let cache_path = Path::new(model_path).with_extension("engine");
+        // Derive cache path including input size to avoid stale caches
+        let cache_path = Path::new(model_path)
+            .with_extension(format!("{}.engine", MODEL_INPUT_SIZE));
         let onnx_cstr =
             CString::new(model_path).context("Invalid model path")?;
         let cache_cstr =
             CString::new(cache_path.to_str().unwrap_or("")).context("Invalid cache path")?;
 
-        let engine = unsafe { trt_engine_create(onnx_cstr.as_ptr(), cache_cstr.as_ptr(), 1) };
+        let engine = unsafe { trt_engine_create(onnx_cstr.as_ptr(), cache_cstr.as_ptr(), 1, MODEL_INPUT_SIZE as c_int) };
         if engine.is_null() {
             bail!("Failed to create TensorRT engine from {}", model_path);
         }
@@ -203,15 +212,33 @@ impl FaceDetector {
     }
 
     /// Run face detection on an RGB image.
-    pub fn detect_rgb(&mut self, image: &RgbImage) -> Result<Vec<FaceDetection>> {
+    pub fn detect_rgb(&mut self, image: &RgbImage) -> Result<(Vec<FaceDetection>, InferTiming)> {
         let (input_data, scale, pad_x, pad_y) = preprocess_rgb(image);
         self.detect_raw(image.width(), image.height(), input_data, scale, pad_x, pad_y)
     }
 
     /// Run face detection on a grayscale (IR) image.
-    pub fn detect_gray(&mut self, image: &GrayImage) -> Result<Vec<FaceDetection>> {
+    pub fn detect_gray(&mut self, image: &GrayImage) -> Result<(Vec<FaceDetection>, InferTiming)> {
         let (input_data, scale, pad_x, pad_y) = preprocess_gray(image);
         self.detect_raw(image.width(), image.height(), input_data, scale, pad_x, pad_y)
+    }
+
+    /// Run face detection on an RGB crop. Returns landmarks in the crop's coordinate space.
+    pub fn detect_rgb_crop(&mut self, image: &RgbImage) -> Result<Option<[FaceLandmark; 5]>> {
+        let (faces, _) = self.detect_rgb(image)?;
+        Ok(faces
+            .into_iter()
+            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
+            .and_then(|f| f.landmarks))
+    }
+
+    /// Run face detection on a grayscale crop. Returns landmarks in the crop's coordinate space.
+    pub fn detect_gray_crop(&mut self, image: &GrayImage) -> Result<Option<[FaceLandmark; 5]>> {
+        let (faces, _) = self.detect_gray(image)?;
+        Ok(faces
+            .into_iter()
+            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
+            .and_then(|f| f.landmarks))
     }
 
     fn detect_raw(
@@ -222,7 +249,7 @@ impl FaceDetector {
         scale: f32,
         pad_x: f32,
         pad_y: f32,
-    ) -> Result<Vec<FaceDetection>> {
+    ) -> Result<(Vec<FaceDetection>, InferTiming)> {
         let mut output_ptrs: Vec<*mut f32> = self
             .output_bufs
             .iter_mut()
@@ -232,6 +259,7 @@ impl FaceDetector {
         let mut output_sizes_bytes: Vec<usize> = self.output_sizes.clone();
 
         let input_bytes = input_data.len() * std::mem::size_of::<f32>();
+        let t_infer = Instant::now();
         let ret = unsafe {
             trt_engine_infer(
                 self.engine,
@@ -242,10 +270,12 @@ impl FaceDetector {
                 self.num_outputs as i32,
             )
         };
+        let trt_infer_ms = t_infer.elapsed().as_secs_f64() * 1000.0;
         if ret != 0 {
             bail!("TensorRT inference failed with error code {}", ret);
         }
 
+        let t_post = Instant::now();
         // Decode detections
         let mut detections = Vec::new();
 
@@ -295,24 +325,352 @@ impl FaceDetector {
                                 y: ((ly - pad_y) / scale).clamp(0.0, img_h as f32),
                             };
                         }
-                        lms
+                        Some(lms)
                     } else {
-                        [FaceLandmark { x: 0.0, y: 0.0 }; 5]
+                        None
                     };
 
                     detections.push(FaceDetection {
                         bbox: [x1, y1, x2, y2],
                         confidence: score,
                         landmarks,
+                        xyz: None,
                     });
                 }
             }
         }
 
         nms(&mut detections);
+        let postprocess_ms = t_post.elapsed().as_secs_f64() * 1000.0;
 
-        Ok(detections)
+        Ok((detections, InferTiming { trt_infer_ms, postprocess_ms }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// YOLO Head Detector
+// ---------------------------------------------------------------------------
+
+const YOLO_CONF_THRESHOLD: f32 = 0.5;
+// YOLO uses 0-1 normalization (divide by 255)
+const YOLO_INPUT_MEAN: f32 = 0.0;
+const YOLO_INPUT_STD: f32 = 255.0;
+
+pub struct HeadDetector {
+    engine: *mut TrtEngine,
+    num_outputs: usize,
+    output_sizes: Vec<usize>,
+    output_bufs: Vec<Vec<f32>>,
+    /// Number of detections (e.g. 8400 for 640x640 input)
+    num_detections: usize,
+    /// Number of values per detection (4 bbox + num_classes)
+    values_per_det: usize,
+    /// Whether output is transposed: [1, values, dets] vs [1, dets, values]
+    transposed: bool,
+}
+
+unsafe impl Send for HeadDetector {}
+
+impl Drop for HeadDetector {
+    fn drop(&mut self) {
+        unsafe {
+            trt_engine_destroy(self.engine);
+        }
+    }
+}
+
+impl HeadDetector {
+    pub fn new(model_path: &str) -> Result<Self> {
+        let cache_path = Path::new(model_path)
+            .with_extension(format!("{}.engine", MODEL_INPUT_SIZE));
+        let onnx_cstr = CString::new(model_path).context("Invalid model path")?;
+        let cache_cstr =
+            CString::new(cache_path.to_str().unwrap_or("")).context("Invalid cache path")?;
+
+        let engine = unsafe { trt_engine_create(onnx_cstr.as_ptr(), cache_cstr.as_ptr(), 1, MODEL_INPUT_SIZE as c_int) };
+        if engine.is_null() {
+            bail!("Failed to create TensorRT engine from {}", model_path);
+        }
+
+        // Find the single output tensor
+        let num_io = unsafe { trt_engine_num_io(engine) };
+        let mut outputs: Vec<(usize, String, Vec<i64>)> = Vec::new();
+        let mut out_idx = 0usize;
+
+        for i in 0..num_io {
+            let name_ptr = unsafe { trt_engine_tensor_name(engine, i) };
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_str()
+                .unwrap_or("")
+                .to_string();
+            let name_c = CString::new(name.as_str()).unwrap();
+            let is_input = unsafe { trt_engine_tensor_is_input(engine, name_c.as_ptr()) };
+            if is_input == 1 {
+                continue;
+            }
+
+            let mut dims = [0i64; 8];
+            let mut nb_dims = 0i32;
+            unsafe {
+                trt_engine_tensor_shape(engine, name_c.as_ptr(), dims.as_mut_ptr(), &mut nb_dims);
+            }
+            let shape: Vec<i64> = dims[..nb_dims as usize].to_vec();
+            outputs.push((out_idx, name, shape));
+            out_idx += 1;
+        }
+
+        tracing::info!("YOLO head detector has {} output tensors", outputs.len());
+        for (idx, name, shape) in &outputs {
+            tracing::info!("  output[{}] '{}' shape={:?}", idx, name, shape);
+        }
+
+        // YOLOv8 output is either [1, num_dets, 5+] or [1, 5+, num_dets]
+        // Detect format from the main output tensor (typically the largest one)
+        let main_output = outputs
+            .iter()
+            .max_by_key(|(_, _, shape)| shape.iter().product::<i64>())
+            .context("No output tensors found")?;
+        let shape = &main_output.2;
+
+        let (num_detections, values_per_det, transposed) = if shape.len() == 3 {
+            let dim1 = shape[1] as usize;
+            let dim2 = shape[2] as usize;
+            if dim1 > dim2 {
+                // [1, num_dets, values] — not transposed
+                (dim1, dim2, false)
+            } else {
+                // [1, values, num_dets] — transposed (standard YOLOv8 export)
+                (dim2, dim1, true)
+            }
+        } else if shape.len() == 2 {
+            (shape[0] as usize, shape[1] as usize, false)
+        } else {
+            bail!("Unexpected YOLO output shape: {:?}", shape);
+        };
+
+        tracing::info!(
+            "YOLO format: {} detections x {} values, transposed={}",
+            num_detections,
+            values_per_det,
+            transposed
+        );
+
+        if values_per_det < 5 {
+            bail!(
+                "YOLO output has {} values per detection, need at least 5 (4 bbox + 1 class)",
+                values_per_det
+            );
+        }
+
+        let num_outputs = outputs.len();
+        let mut output_sizes = Vec::with_capacity(num_outputs);
+        for (_, _, shape) in &outputs {
+            let vol: i64 = shape.iter().product();
+            output_sizes.push(vol as usize * std::mem::size_of::<f32>());
+        }
+
+        let output_bufs = output_sizes
+            .iter()
+            .map(|&sz| vec![0.0f32; sz / std::mem::size_of::<f32>()])
+            .collect();
+
+        tracing::info!(
+            "YOLO head detection model loaded via TensorRT (FP16 enabled, {} outputs)",
+            num_outputs
+        );
+
+        Ok(HeadDetector {
+            engine,
+            num_outputs,
+            output_sizes,
+            output_bufs,
+            num_detections,
+            values_per_det,
+            transposed,
+        })
+    }
+
+    /// Run head detection on an RGB image.
+    pub fn detect_rgb(&mut self, image: &RgbImage) -> Result<(Vec<FaceDetection>, InferTiming)> {
+        let (input_data, scale, pad_x, pad_y) = preprocess_rgb_yolo(image);
+        self.detect_raw(image.width(), image.height(), input_data, scale, pad_x, pad_y)
+    }
+
+    /// Run head detection on a grayscale (IR) image.
+    pub fn detect_gray(&mut self, image: &GrayImage) -> Result<(Vec<FaceDetection>, InferTiming)> {
+        let (input_data, scale, pad_x, pad_y) = preprocess_gray_yolo(image);
+        self.detect_raw(image.width(), image.height(), input_data, scale, pad_x, pad_y)
+    }
+
+    fn detect_raw(
+        &mut self,
+        img_w: u32,
+        img_h: u32,
+        input_data: Vec<f32>,
+        scale: f32,
+        pad_x: f32,
+        pad_y: f32,
+    ) -> Result<(Vec<FaceDetection>, InferTiming)> {
+        let mut output_ptrs: Vec<*mut f32> = self
+            .output_bufs
+            .iter_mut()
+            .map(|buf| buf.as_mut_ptr())
+            .collect();
+        let mut output_sizes_bytes: Vec<usize> = self.output_sizes.clone();
+
+        let input_bytes = input_data.len() * std::mem::size_of::<f32>();
+        let t_infer = Instant::now();
+        let ret = unsafe {
+            trt_engine_infer(
+                self.engine,
+                input_data.as_ptr(),
+                input_bytes,
+                output_ptrs.as_mut_ptr(),
+                output_sizes_bytes.as_mut_ptr(),
+                self.num_outputs as i32,
+            )
+        };
+        let trt_infer_ms = t_infer.elapsed().as_secs_f64() * 1000.0;
+        if ret != 0 {
+            bail!("TensorRT inference failed with error code {}", ret);
+        }
+
+        let t_post = Instant::now();
+        // Decode YOLO detections from the first (main) output buffer
+        let data = &self.output_bufs[0];
+        let mut detections = Vec::new();
+        let num_classes = self.values_per_det - 4;
+
+        for i in 0..self.num_detections {
+            // Extract values depending on layout
+            let (cx, cy, w, h, class_scores_start) = if self.transposed {
+                // [1, values_per_det, num_detections] — column-major per detection
+                let stride = self.num_detections;
+                (
+                    data[0 * stride + i],
+                    data[1 * stride + i],
+                    data[2 * stride + i],
+                    data[3 * stride + i],
+                    4usize,
+                )
+            } else {
+                // [1, num_detections, values_per_det] — row-major per detection
+                let off = i * self.values_per_det;
+                (data[off], data[off + 1], data[off + 2], data[off + 3], 4usize)
+            };
+
+            // Find max class score
+            let mut max_score = 0.0f32;
+            for c in 0..num_classes {
+                let score = if self.transposed {
+                    data[(class_scores_start + c) * self.num_detections + i]
+                } else {
+                    data[i * self.values_per_det + class_scores_start + c]
+                };
+                if score > max_score {
+                    max_score = score;
+                }
+            }
+
+            if max_score < YOLO_CONF_THRESHOLD {
+                continue;
+            }
+
+            // Convert from center/size to corner coordinates, undo letterbox
+            let x1 = ((cx - w / 2.0 - pad_x) / scale).clamp(0.0, img_w as f32);
+            let y1 = ((cy - h / 2.0 - pad_y) / scale).clamp(0.0, img_h as f32);
+            let x2 = ((cx + w / 2.0 - pad_x) / scale).clamp(0.0, img_w as f32);
+            let y2 = ((cy + h / 2.0 - pad_y) / scale).clamp(0.0, img_h as f32);
+
+            detections.push(FaceDetection {
+                bbox: [x1, y1, x2, y2],
+                confidence: max_score,
+                landmarks: None,
+                xyz: None,
+            });
+        }
+
+        nms(&mut detections);
+        let postprocess_ms = t_post.elapsed().as_secs_f64() * 1000.0;
+        Ok((detections, InferTiming { trt_infer_ms, postprocess_ms }))
+    }
+}
+
+/// Preprocess RGB image for YOLO: letterbox resize to 640x640, normalize to 0-1.
+fn preprocess_rgb_yolo(image: &RgbImage) -> (Vec<f32>, f32, f32, f32) {
+    let (img_w, img_h) = (image.width() as f32, image.height() as f32);
+    let target = MODEL_INPUT_SIZE as f32;
+
+    let scale = (target / img_w).min(target / img_h);
+    let new_w = (img_w * scale) as u32;
+    let new_h = (img_h * scale) as u32;
+
+    let resized =
+        image::imageops::resize(image, new_w, new_h, image::imageops::FilterType::Triangle);
+
+    let pad_x = (MODEL_INPUT_SIZE - new_w) as f32 / 2.0;
+    let pad_y = (MODEL_INPUT_SIZE - new_h) as f32 / 2.0;
+    let pad_x_i = pad_x as u32;
+    let pad_y_i = pad_y as u32;
+
+    let mut padded = RgbImage::from_pixel(
+        MODEL_INPUT_SIZE,
+        MODEL_INPUT_SIZE,
+        image::Rgb([114, 114, 114]), // YOLO uses gray padding
+    );
+    image::imageops::overlay(&mut padded, &resized, pad_x_i as i64, pad_y_i as i64);
+
+    let sz = MODEL_INPUT_SIZE as usize;
+    let mut data = vec![0.0f32; 3 * sz * sz];
+    for y in 0..sz {
+        for x in 0..sz {
+            let pixel = padded.get_pixel(x as u32, y as u32);
+            data[y * sz + x] = (pixel[0] as f32 - YOLO_INPUT_MEAN) / YOLO_INPUT_STD;
+            data[sz * sz + y * sz + x] = (pixel[1] as f32 - YOLO_INPUT_MEAN) / YOLO_INPUT_STD;
+            data[2 * sz * sz + y * sz + x] = (pixel[2] as f32 - YOLO_INPUT_MEAN) / YOLO_INPUT_STD;
+        }
+    }
+
+    (data, scale, pad_x, pad_y)
+}
+
+/// Preprocess grayscale image for YOLO: letterbox resize to 640x640, replicate to 3 channels, normalize to 0-1.
+fn preprocess_gray_yolo(image: &GrayImage) -> (Vec<f32>, f32, f32, f32) {
+    let (img_w, img_h) = (image.width() as f32, image.height() as f32);
+    let target = MODEL_INPUT_SIZE as f32;
+
+    let scale = (target / img_w).min(target / img_h);
+    let new_w = (img_w * scale) as u32;
+    let new_h = (img_h * scale) as u32;
+
+    let resized =
+        image::imageops::resize(image, new_w, new_h, image::imageops::FilterType::Triangle);
+
+    let pad_x = (MODEL_INPUT_SIZE - new_w) as f32 / 2.0;
+    let pad_y = (MODEL_INPUT_SIZE - new_h) as f32 / 2.0;
+    let pad_x_i = pad_x as u32;
+    let pad_y_i = pad_y as u32;
+
+    let mut padded = GrayImage::from_pixel(
+        MODEL_INPUT_SIZE,
+        MODEL_INPUT_SIZE,
+        image::Luma([114]), // YOLO uses gray padding
+    );
+    image::imageops::overlay(&mut padded, &resized, pad_x_i as i64, pad_y_i as i64);
+
+    let sz = MODEL_INPUT_SIZE as usize;
+    let mut data = vec![0.0f32; 3 * sz * sz];
+    for y in 0..sz {
+        for x in 0..sz {
+            let val = (padded.get_pixel(x as u32, y as u32)[0] as f32 - YOLO_INPUT_MEAN)
+                / YOLO_INPUT_STD;
+            data[y * sz + x] = val;
+            data[sz * sz + y * sz + x] = val;
+            data[2 * sz * sz + y * sz + x] = val;
+        }
+    }
+
+    (data, scale, pad_x, pad_y)
 }
 
 /// Preprocess RGB image: letterbox resize to 640x640, normalize with mean/std.

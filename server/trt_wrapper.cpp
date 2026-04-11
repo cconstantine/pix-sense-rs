@@ -87,7 +87,7 @@ static bool write_file(const char* path, const void* data, size_t size) {
     return f.good();
 }
 
-extern "C" TrtEngine* trt_engine_create(const char* onnx_path, const char* cache_path, int fp16) {
+extern "C" TrtEngine* trt_engine_create(const char* onnx_path, const char* cache_path, int fp16, int input_size) {
     auto eng = std::make_unique<TrtEngine>();
 
     IHostMemory* serialized = nullptr;
@@ -167,11 +167,11 @@ extern "C" TrtEngine* trt_engine_create(const char* onnx_path, const char* cache
             }
 
             if (has_dynamic) {
-                // For SCRFD: input is [1, 3, -1, -1], fix to [1, 3, 640, 640]
+                // For models with dynamic spatial dims, fix to requested input_size
                 Dims fixed = dims;
                 for (int d = 0; d < fixed.nbDims; d++) {
                     if (fixed.d[d] == -1) {
-                        fixed.d[d] = 640; // Use model input size
+                        fixed.d[d] = input_size;
                     }
                 }
                 profile->setDimensions(name, OptProfileSelector::kMIN, fixed);

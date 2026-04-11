@@ -4,10 +4,11 @@ use pix_sense_common::FaceDetection;
 const BBOX_COLOR: Color32 = Color32::from_rgb(0, 255, 255);
 const EYE_COLOR: Color32 = Color32::from_rgb(0, 255, 0);
 const LANDMARK_COLOR: Color32 = Color32::from_rgb(255, 255, 0);
+const XYZ_COLOR: Color32 = Color32::from_rgb(255, 180, 0);
 const EYE_RADIUS: f32 = 6.0;
 const LANDMARK_RADIUS: f32 = 3.0;
 
-/// Draw face detections with eye landmarks on the egui painter.
+/// Draw face detections with optional landmarks and XYZ coordinates on the egui painter.
 pub fn draw_faces(
     painter: &Painter,
     faces: &[FaceDetection],
@@ -34,7 +35,7 @@ pub fn draw_faces(
             StrokeKind::Outside,
         );
 
-        // Draw confidence label
+        // Confidence label above the box
         let label = format!("{:.0}%", face.confidence * 100.0);
         painter.text(
             rect.left_top() + egui::vec2(2.0, -14.0),
@@ -44,22 +45,36 @@ pub fn draw_faces(
             BBOX_COLOR,
         );
 
-        // Draw landmarks
-        for (i, lm) in face.landmarks.iter().enumerate() {
-            let center = Pos2::new(
-                offset.x + lm.x * scale_x,
-                offset.y + lm.y * scale_y,
+        // XYZ coordinates below the confidence label (inside the box top)
+        if let Some([x, y, z]) = face.xyz {
+            let xyz_label = format!("({:.2},{:.2},{:.2})m", x, y, z);
+            painter.text(
+                rect.left_top() + egui::vec2(2.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                xyz_label,
+                egui::FontId::monospace(10.0),
+                XYZ_COLOR,
             );
+        }
 
-            // Eyes get larger, green circles; other landmarks are smaller, yellow
-            let (radius, color) = if i <= 1 {
-                (EYE_RADIUS, EYE_COLOR)
-            } else {
-                (LANDMARK_RADIUS, LANDMARK_COLOR)
-            };
+        // Draw landmarks (if available — head-only detections may not have them)
+        if let Some(ref landmarks) = face.landmarks {
+            for (i, lm) in landmarks.iter().enumerate() {
+                let center = Pos2::new(
+                    offset.x + lm.x * scale_x,
+                    offset.y + lm.y * scale_y,
+                );
 
-            painter.circle_filled(center, radius, color);
-            painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::BLACK));
+                // Eyes get larger, green circles; other landmarks are smaller, yellow
+                let (radius, color) = if i <= 1 {
+                    (EYE_RADIUS, EYE_COLOR)
+                } else {
+                    (LANDMARK_RADIUS, LANDMARK_COLOR)
+                };
+
+                painter.circle_filled(center, radius, color);
+                painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::BLACK));
+            }
         }
     }
 }

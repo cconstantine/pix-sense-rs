@@ -11,7 +11,50 @@ pub struct FaceDetection {
     pub bbox: [f32; 4], // x1, y1, x2, y2
     pub confidence: f32,
     /// 5 landmarks: left_eye, right_eye, nose, left_mouth, right_mouth
-    pub landmarks: [FaceLandmark; 5],
+    /// None when detected from behind or when only head (not face) was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landmarks: Option<[FaceLandmark; 5]>,
+    /// 3D position in camera frame (metres): [X right, Y down, Z forward].
+    /// None when depth data is unavailable at the face centre.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xyz: Option<[f32; 3]>,
+}
+
+/// Which detection algorithm to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionAlgo {
+    /// Fast YOLOv8n head detector — all orientations, no landmarks (~5-10 ms GPU).
+    YoloHead,
+    /// SCRFD face detector on the full frame — frontal/angled with 5-point landmarks (~10-15 ms GPU).
+    ScrfdFace,
+    /// Two-stage: YOLO finds head ROIs, SCRFD refines with landmarks (~15-25 ms GPU).
+    YoloHeadScrfdLandmarks,
+}
+
+/// Which camera stream(s) to run detection on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamSelection {
+    Rgb,
+    Ir,
+    Both,
+}
+
+/// Runtime detection configuration — shared between server and client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionConfig {
+    pub algo: DetectionAlgo,
+    pub stream: StreamSelection,
+}
+
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        Self {
+            algo: DetectionAlgo::YoloHead,
+            stream: StreamSelection::Both,
+        }
+    }
 }
 
 /// Metadata sent alongside JPEG-encoded frames over WebSocket.
@@ -22,6 +65,8 @@ pub struct FrameMetadata {
     pub rgb_size: [u32; 2],
     pub ir_size: [u32; 2],
     pub depth_size: [u32; 2],
+    /// The algorithm + stream configuration that was active when this frame was processed.
+    pub active_config: DetectionConfig,
 }
 
 /// Binary message format:

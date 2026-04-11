@@ -4,20 +4,43 @@ use realsense_rust::{
     config::Config,
     context::Context as RsContext,
     frame::{ColorFrame, DepthFrame, InfraredFrame},
-    kind::{Rs2CameraInfo, Rs2Format, Rs2StreamKind},
+    kind::{Rs2CameraInfo, Rs2Format, Rs2Option, Rs2StreamKind},
     pipeline::InactivePipeline,
+    processing_blocks::align::Align,
 };
 use std::collections::HashSet;
 
+/// Pinhole camera intrinsics for the colour stream (all streams are aligned to it).
+#[derive(Debug, Clone, Copy)]
+pub struct CameraIntrinsics {
+    pub fx: f32,
+    pub fy: f32,
+    /// Principal point X (cx)
+    pub ppx: f32,
+    /// Principal point Y (cy)
+    pub ppy: f32,
+}
+
+impl Default for CameraIntrinsics {
+    /// Typical Intel RealSense D435 values at 640×480. Used as a fallback only.
+    fn default() -> Self {
+        Self { fx: 615.0, fy: 615.0, ppx: 320.0, ppy: 240.0 }
+    }
+}
+
 pub struct Camera {
     pipeline: realsense_rust::pipeline::ActivePipeline,
+    align: Align,
+    intrinsics: CameraIntrinsics,
 }
 
 pub struct CameraFrames {
     pub rgb: RgbImage,
     pub ir: GrayImage,
     pub depth: GrayImage,
+    pub depth_raw: Vec<u16>, // Z16 values in mm, same W×H as depth
     pub depth_size: [u32; 2],
+    pub intrinsics: CameraIntrinsics,
 }
 
 impl Camera {
@@ -60,16 +83,51 @@ impl Camera {
             .start(Some(config))
             .context("Failed to start pipeline")?;
 
-        Ok(Camera { pipeline })
+        // Disable the IR dot projector so it doesn't interfere with the IR image
+        for mut sensor in pipeline.profile().device().sensors() {
+            if sensor.set_option(Rs2Option::EmitterEnabled, 0.0).is_ok() {
+                tracing::info!("Disabled IR emitter (dot projector)");
+            }
+        }
+
+        // Extract colour-stream intrinsics for 3-D deprojection.
+        let intrinsics = pipeline
+            .profile()
+            .streams()
+            .iter()
+            .find(|s| s.kind() == Rs2StreamKind::Color)
+            .and_then(|s| s.intrinsics().ok())
+            .map(|i| CameraIntrinsics { fx: i.fx(), fy: i.fy(), ppx: i.ppx(), ppy: i.ppy() })
+            .unwrap_or_else(|| {
+                tracing::warn!("Could not read camera intrinsics — using D435 defaults");
+                CameraIntrinsics::default()
+            });
+        tracing::info!(
+            "Camera intrinsics: fx={:.1} fy={:.1} cx={:.1} cy={:.1}",
+            intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy
+        );
+
+        // Align IR and depth streams to the color camera's coordinate space.
+        // This keeps RGB native (no reprojection artifacts) and reprojects IR to match.
+        let align = Align::new(Rs2StreamKind::Color, 10)
+            .context("Failed to create alignment processing block")?;
+
+        Ok(Camera { pipeline, align, intrinsics })
     }
 
     /// Try to capture a frame. Returns None on timeout (caller should retry).
     pub fn capture(&mut self) -> Result<Option<CameraFrames>> {
         let timeout = std::time::Duration::from_millis(500);
-        let frames = match self.pipeline.wait(Some(timeout)) {
+        let raw_frames = match self.pipeline.wait(Some(timeout)) {
             Ok(f) => f,
             Err(_) => return Ok(None), // timeout, not an error
         };
+
+        // Align all streams to the infrared coordinate space
+        self.align.queue(raw_frames)
+            .context("Failed to queue frames for alignment")?;
+        let frames = self.align.wait(std::time::Duration::from_millis(100))
+            .context("Failed to get aligned frames")?;
 
         let mut rgb_image = None;
         let mut ir_image = None;
@@ -121,8 +179,9 @@ impl Camera {
         }
 
         // Extract depth frames (Z16: 16-bit unsigned, millimeters)
-        // Map to 8-bit grayscale with a fixed range for speed; colorize on the client.
+        // Keep raw u16 values for 3-D deprojection; also produce 8-bit grayscale for display.
         let mut depth_image = None;
+        let mut depth_raw_buf: Vec<u16> = Vec::new();
         let mut depth_w = 640u32;
         let mut depth_h = 480u32;
         let depth_frames = frames.frames_of_type::<DepthFrame>();
@@ -141,6 +200,7 @@ impl Camera {
                         (w * h) as usize,
                     )
                 };
+                depth_raw_buf = raw.to_vec();
                 depth_image = Some(depth_to_gray(raw, w, h));
             }
         }
@@ -153,7 +213,9 @@ impl Camera {
             rgb,
             ir,
             depth,
+            depth_raw: depth_raw_buf,
             depth_size: [depth_w, depth_h],
+            intrinsics: self.intrinsics,
         }))
     }
 }

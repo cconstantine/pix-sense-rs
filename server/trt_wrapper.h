@@ -14,8 +14,9 @@ typedef struct TrtEngine TrtEngine;
 /// If cache_path exists, loads the serialized engine (fast).
 /// Otherwise, parses onnx_path, builds the engine, and saves to cache_path.
 /// Set fp16=1 to enable FP16 precision (recommended on Jetson).
+/// input_size: spatial dimension for the model input (e.g. 640 or 1280).
 /// Returns NULL on failure.
-TrtEngine* trt_engine_create(const char* onnx_path, const char* cache_path, int fp16);
+TrtEngine* trt_engine_create(const char* onnx_path, const char* cache_path, int fp16, int input_size);
 
 /// Destroy the engine and free all GPU resources.
 void trt_engine_destroy(TrtEngine* engine);

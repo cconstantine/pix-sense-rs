@@ -2,7 +2,9 @@ mod overlay;
 
 use eframe::egui;
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
-use pix_sense_common::{decode_frame_message, FaceDetection};
+use pix_sense_common::{
+    decode_frame_message, DetectionAlgo, DetectionConfig, FaceDetection, StreamSelection,
+};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -47,7 +49,7 @@ fn get_ws_url() -> String {
 }
 
 struct App {
-    _ws_sender: WsSender,
+    ws_sender: WsSender,
     ws_receiver: WsReceiver,
     rgb_texture: Option<egui::TextureHandle>,
     ir_texture: Option<egui::TextureHandle>,
@@ -59,6 +61,10 @@ struct App {
     depth_size: [u32; 2],
     fps_counter: FpsCounter,
     connected: bool,
+    /// Config the user has selected in the UI (sent to server on change).
+    local_config: DetectionConfig,
+    /// Config the server reports as active (echoed back in FrameMetadata).
+    active_config: DetectionConfig,
 }
 
 struct FpsCounter {
@@ -103,7 +109,7 @@ impl App {
                 .expect("Failed to connect WebSocket");
 
         Self {
-            _ws_sender: ws_sender,
+            ws_sender,
             ws_receiver,
             rgb_texture: None,
             ir_texture: None,
@@ -115,6 +121,8 @@ impl App {
             depth_size: [640, 480],
             fps_counter: FpsCounter::new(),
             connected: false,
+            local_config: DetectionConfig::default(),
+            active_config: DetectionConfig::default(),
         }
     }
 
@@ -128,6 +136,7 @@ impl App {
         self.rgb_size = metadata.rgb_size;
         self.ir_size = metadata.ir_size;
         self.depth_size = metadata.depth_size;
+        self.active_config = metadata.active_config;
 
         // Decode RGB JPEG
         if let Some(color_image) = decode_jpeg_rgb(rgb_jpeg) {
@@ -172,6 +181,29 @@ impl App {
         }
 
         self.fps_counter.tick();
+    }
+
+    /// Send the current local_config to the server as a JSON text message.
+    fn send_config(&mut self) {
+        if let Ok(json) = serde_json::to_string(&self.local_config) {
+            self.ws_sender.send(WsMessage::Text(json));
+        }
+    }
+}
+
+fn algo_label(algo: DetectionAlgo) -> &'static str {
+    match algo {
+        DetectionAlgo::YoloHead => "YOLO Head (fast)",
+        DetectionAlgo::ScrfdFace => "SCRFD Face (landmarks)",
+        DetectionAlgo::YoloHeadScrfdLandmarks => "YOLO+SCRFD (two-stage)",
+    }
+}
+
+fn stream_label(s: StreamSelection) -> &'static str {
+    match s {
+        StreamSelection::Rgb => "RGB",
+        StreamSelection::Ir => "IR",
+        StreamSelection::Both => "RGB + IR",
     }
 }
 
@@ -244,6 +276,8 @@ impl eframe::App for App {
             match event {
                 WsEvent::Opened => {
                     self.connected = true;
+                    // Send initial config so server immediately uses what's shown in UI
+                    self.send_config();
                 }
                 WsEvent::Message(WsMessage::Binary(data)) => {
                     self.handle_binary_message(ctx, &data);
@@ -259,17 +293,86 @@ impl eframe::App for App {
             }
         }
 
-        // Top panel with stats
+        // Top panel with stats and config controls
         egui::TopBottomPanel::top("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let status = if self.connected { "Connected" } else { "Disconnected" };
                 ui.label(format!(
-                    "{} | FPS: {:.1} | RGB Faces: {} | IR Faces: {}",
+                    "{} | FPS: {:.1} | RGB: {} | IR: {}",
                     status,
                     self.fps_counter.fps,
                     self.latest_rgb_faces.len(),
-                    self.latest_ir_faces.len()
+                    self.latest_ir_faces.len(),
                 ));
+
+                ui.separator();
+
+                // Algorithm selector
+                ui.label("Algo:");
+                let prev_algo = self.local_config.algo;
+                egui::ComboBox::from_id_salt("algo_select")
+                    .selected_text(algo_label(self.local_config.algo))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.local_config.algo,
+                            DetectionAlgo::YoloHead,
+                            algo_label(DetectionAlgo::YoloHead),
+                        );
+                        ui.selectable_value(
+                            &mut self.local_config.algo,
+                            DetectionAlgo::ScrfdFace,
+                            algo_label(DetectionAlgo::ScrfdFace),
+                        );
+                        ui.selectable_value(
+                            &mut self.local_config.algo,
+                            DetectionAlgo::YoloHeadScrfdLandmarks,
+                            algo_label(DetectionAlgo::YoloHeadScrfdLandmarks),
+                        );
+                    });
+                if self.local_config.algo != prev_algo {
+                    self.send_config();
+                }
+
+                ui.separator();
+
+                // Stream selector
+                ui.label("Stream:");
+                let prev_stream = self.local_config.stream;
+                egui::ComboBox::from_id_salt("stream_select")
+                    .selected_text(stream_label(self.local_config.stream))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.local_config.stream,
+                            StreamSelection::Rgb,
+                            stream_label(StreamSelection::Rgb),
+                        );
+                        ui.selectable_value(
+                            &mut self.local_config.stream,
+                            StreamSelection::Ir,
+                            stream_label(StreamSelection::Ir),
+                        );
+                        ui.selectable_value(
+                            &mut self.local_config.stream,
+                            StreamSelection::Both,
+                            stream_label(StreamSelection::Both),
+                        );
+                    });
+                if self.local_config.stream != prev_stream {
+                    self.send_config();
+                }
+
+                // Show server-side active config as confirmation (may lag one frame)
+                if self.active_config != self.local_config {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "Server: {} / {}",
+                            algo_label(self.active_config.algo),
+                            stream_label(self.active_config.stream),
+                        ),
+                    );
+                }
             });
         });
 

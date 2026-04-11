@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     libusb-1.0-0-dev \
     libclang-dev \
     nasm \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # Build libjpeg-turbo from source (JetPack image lacks -dev headers)
@@ -52,11 +53,11 @@ fi
 EOF
 RUN chmod +x /usr/local/bin/ensure-model.sh
 
-# Entrypoint runs as root to fix USB permissions, then drops to dev
+# Entrypoint fixes USB permissions via sudo, then execs as dev
 COPY <<'ENTRY' /usr/local/bin/entrypoint.sh
 #!/bin/bash
-chmod a+rw /dev/bus/usb/*/* 2>/dev/null || true
-exec setpriv --reuid=dev --regid=dev --init-groups "$@"
+sudo chmod a+rw /dev/bus/usb/*/* 2>/dev/null || true
+exec "$@"
 ENTRY
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
@@ -65,7 +66,9 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 RUN groupadd --gid $USER_GID dev \
     && useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash dev \
-    && usermod -aG video,plugdev dev
+    && usermod -aG video,plugdev dev \
+    && echo "dev ALL=(root) NOPASSWD: /bin/chmod" > /etc/sudoers.d/dev-usb \
+    && chmod 0440 /etc/sudoers.d/dev-usb
 
 # Install Rust as the dev user
 USER dev
@@ -81,6 +84,5 @@ WORKDIR /app
 EXPOSE 3000
 
 
-USER root
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]
