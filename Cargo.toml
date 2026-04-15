@@ -1,3 +1,9 @@
 [workspace]
 members = ["common", "server", "client"]
 resolver = "2"
+
+# Optimise all dependencies (egui tessellation, image decoding, etc.) even
+# in dev builds.  Without this, WASM debug builds are unusably slow because
+# egui's shadow/frame mesh generation and the JPEG decoder run at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2

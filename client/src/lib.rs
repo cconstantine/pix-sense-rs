@@ -4,7 +4,7 @@ use eframe::egui;
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 use pix_sense_common::{
     decode_frame_message, CalibrationPoint, CameraExtrinsics, DetectionAlgo, DetectionConfig,
-    FaceDetection, LedPoint, StreamSelection, TrackingPoint,
+    FaceDetection, LedPoint, Pattern, PatternUpdate, ServerMessage, StreamSelection, TrackingPoint,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -51,10 +51,27 @@ fn get_ws_url() -> String {
     format!("{}//{}/ws", ws_protocol, host)
 }
 
-#[derive(PartialEq, Clone)]
-enum ViewMode {
-    Cameras,
-    Scene,
+
+const DEFAULT_PATTERN_GLSL: &str = "\
+void main() {\n\
+    vec2 uv = gl_FragCoord.xy / resolution;\n\
+    fragColor = vec4(uv, 0.5 + 0.5 * sin(time * 0.001), 1.0);\n\
+}\n";
+
+struct PatternDraft {
+    original_name: String,
+    name: String,
+    glsl: String,
+    enabled: bool,
+    overscan: bool,
+    is_new: bool,
+}
+
+fn is_valid_pattern_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
 struct App {
@@ -62,12 +79,10 @@ struct App {
     ws_receiver: WsReceiver,
     rgb_texture: Option<egui::TextureHandle>,
     ir_texture: Option<egui::TextureHandle>,
-    depth_texture: Option<egui::TextureHandle>,
     latest_rgb_faces: Vec<FaceDetection>,
     latest_ir_faces: Vec<FaceDetection>,
     rgb_size: [u32; 2],
     ir_size: [u32; 2],
-    depth_size: [u32; 2],
     fps_counter: FpsCounter,
     connected: bool,
     /// Config the user has selected in the UI (sent to server on change).
@@ -77,14 +92,18 @@ struct App {
     // 3D scene data
     leds: Vec<LedPoint>,
     tracking: Vec<TrackingPoint>,
+    /// Current LED colors from the renderer, indexed parallel to `leds`.
+    led_colors: Vec<[u8; 3]>,
     /// Populated once by the /api/leds fetch; None until the response arrives.
     led_pending: Rc<RefCell<Option<Vec<LedPoint>>>>,
     // 3D orbit camera state
     scene_yaw: f32,
     scene_pitch: f32,
     scene_zoom: f32,
-    // View state
-    view_mode: ViewMode,
+    // Window visibility
+    show_cameras: bool,
+    show_scene: bool,
+    show_patterns: bool,
     locked_location: Option<String>,
     // Calibration state
     calib_mode: bool,
@@ -107,6 +126,13 @@ struct App {
     manual_t: [f32; 3],
     /// Euler XYZ rotation angles in degrees (R = Rz·Ry·Rx), synced to/from `extrinsics.r`.
     manual_euler_deg: [f32; 3],
+    // Patterns panel
+    patterns: Vec<Pattern>,
+    patterns_pending: Rc<RefCell<Option<Vec<Pattern>>>>,
+    active_pattern: String,
+    active_pattern_pending: Rc<RefCell<Option<String>>>,
+    pattern_editing: Option<PatternDraft>,
+    pattern_new_name: String,
 }
 
 struct FpsCounter {
@@ -208,28 +234,55 @@ impl App {
             }
         });
 
+        // Fetch pattern list.
+        let patterns_pending: Rc<RefCell<Option<Vec<Pattern>>>> = Rc::new(RefCell::new(None));
+        let pp_clone = patterns_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get("/api/patterns").send().await {
+                if let Ok(patterns) = resp.json::<Vec<Pattern>>().await {
+                    *pp_clone.borrow_mut() = Some(patterns);
+                }
+            }
+        });
+
+        // Fetch active pattern name.
+        let active_pattern_pending: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let ap_clone = active_pattern_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get("/api/patterns/active").send().await {
+                if resp.status() == 200 {
+                    if let Ok(name) = resp.text().await {
+                        *ap_clone.borrow_mut() = Some(name);
+                    }
+                } else {
+                    *ap_clone.borrow_mut() = Some(String::new());
+                }
+            }
+        });
+
         Self {
             ws_sender,
             ws_receiver,
             rgb_texture: None,
             ir_texture: None,
-            depth_texture: None,
             latest_rgb_faces: Vec::new(),
             latest_ir_faces: Vec::new(),
             rgb_size: [640, 480],
             ir_size: [640, 480],
-            depth_size: [640, 480],
             fps_counter: FpsCounter::new(),
             connected: false,
             local_config: DetectionConfig::default(),
             active_config: DetectionConfig::default(),
             leds: Vec::new(),
             tracking: Vec::new(),
+            led_colors: Vec::new(),
             led_pending,
             scene_yaw: 0.3,
             scene_pitch: -0.4,
             scene_zoom: 5.0,
-            view_mode: ViewMode::Cameras,
+            show_cameras: true,
+            show_scene: true,
+            show_patterns: true,
             locked_location: None,
             calib_mode: false,
             calib_points: Vec::new(),
@@ -242,11 +295,17 @@ impl App {
             camera_id_pending,
             manual_t: [0.0; 3],
             manual_euler_deg: [0.0; 3],
+            patterns: Vec::new(),
+            patterns_pending,
+            active_pattern: String::new(),
+            active_pattern_pending,
+            pattern_editing: None,
+            pattern_new_name: String::new(),
         }
     }
 
     fn handle_binary_message(&mut self, ctx: &egui::Context, data: &[u8]) {
-        let Some((rgb_jpeg, ir_jpeg, depth_jpeg, metadata)) = decode_frame_message(data) else {
+        let Some((rgb_jpeg, ir_jpeg, metadata)) = decode_frame_message(data) else {
             return;
         };
 
@@ -254,7 +313,6 @@ impl App {
         self.latest_ir_faces = metadata.ir_faces;
         self.rgb_size = metadata.rgb_size;
         self.ir_size = metadata.ir_size;
-        self.depth_size = metadata.depth_size;
         self.active_config = metadata.active_config;
 
         // Decode RGB JPEG
@@ -278,20 +336,6 @@ impl App {
                 None => {
                     self.ir_texture = Some(ctx.load_texture(
                         "ir_feed",
-                        color_image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                }
-            }
-        }
-
-        // Decode depth JPEG (grayscale) and colorize client-side
-        if let Some(color_image) = decode_jpeg_depth(depth_jpeg) {
-            match &mut self.depth_texture {
-                Some(tex) => tex.set(color_image, egui::TextureOptions::LINEAR),
-                None => {
-                    self.depth_texture = Some(ctx.load_texture(
-                        "depth_feed",
                         color_image,
                         egui::TextureOptions::LINEAR,
                     ));
@@ -350,7 +394,6 @@ fn stream_label(s: StreamSelection) -> &'static str {
     match s {
         StreamSelection::Rgb => "RGB",
         StreamSelection::Ir => "IR",
-        StreamSelection::Both => "RGB + IR",
     }
 }
 
@@ -380,41 +423,6 @@ fn decode_jpeg_gray(jpeg_data: &[u8]) -> Option<egui::ColorImage> {
     })
 }
 
-fn decode_jpeg_depth(jpeg_data: &[u8]) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory_with_format(jpeg_data, image::ImageFormat::Jpeg).ok()?;
-    let gray = img.to_luma8();
-    let pixels: Vec<egui::Color32> = gray
-        .pixels()
-        .map(|p| depth_colormap(p[0]))
-        .collect();
-    Some(egui::ColorImage {
-        size: [gray.width() as usize, gray.height() as usize],
-        pixels,
-    })
-}
-
-/// Piecewise-linear colormap: 0 → black (no data), near → blue, mid → green, far → red.
-fn depth_colormap(v: u8) -> egui::Color32 {
-    if v == 0 {
-        return egui::Color32::BLACK;
-    }
-    // Map 1..=255 into 0.0..=1.0
-    let t = (v - 1) as f32 / 254.0;
-    let (r, g, b) = if t < 0.25 {
-        let s = t / 0.25;
-        (0.0, s, 1.0)
-    } else if t < 0.5 {
-        let s = (t - 0.25) / 0.25;
-        (0.0, 1.0, 1.0 - s)
-    } else if t < 0.75 {
-        let s = (t - 0.5) / 0.25;
-        (s, 1.0, 0.0)
-    } else {
-        let s = (t - 0.75) / 0.25;
-        (1.0, 1.0 - s, 0.0)
-    };
-    egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
-}
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -436,22 +444,37 @@ impl eframe::App for App {
         if let Some(pts) = self.points_pending.borrow_mut().take() {
             self.calib_points = pts;
         }
+        if let Some(patterns) = self.patterns_pending.borrow_mut().take() {
+            self.patterns = patterns;
+        }
+        if let Some(active) = self.active_pattern_pending.borrow_mut().take() {
+            self.active_pattern = active;
+        }
 
         // Poll WebSocket for new frames and tracking updates
         while let Some(event) = self.ws_receiver.try_recv() {
             match event {
                 WsEvent::Opened => {
                     self.connected = true;
-                    // Send initial config so server immediately uses what's shown in UI
-                    self.send_config();
+                    // Server will push its current config; do not send our default.
                 }
                 WsEvent::Message(WsMessage::Binary(data)) => {
                     self.handle_binary_message(ctx, &data);
                 }
                 WsEvent::Message(WsMessage::Text(text)) => {
-                    // Server sends tracking_locations as a JSON array of TrackingPoint
-                    if let Ok(pts) = serde_json::from_str::<Vec<TrackingPoint>>(&text) {
-                        self.tracking = pts;
+                    if let Ok(msg) = serde_json::from_str::<ServerMessage>(&text) {
+                        match msg {
+                            ServerMessage::Tracking(pts) => {
+                                self.tracking = pts;
+                            }
+                            ServerMessage::LedColors(colors) => {
+                                self.led_colors = colors;
+                            }
+                            ServerMessage::Config(cfg) => {
+                                self.local_config = cfg;
+                                self.active_config = cfg;
+                            }
+                        }
                     }
                 }
                 WsEvent::Error(e) => {
@@ -523,11 +546,6 @@ impl eframe::App for App {
                             StreamSelection::Ir,
                             stream_label(StreamSelection::Ir),
                         );
-                        ui.selectable_value(
-                            &mut self.local_config.stream,
-                            StreamSelection::Both,
-                            stream_label(StreamSelection::Both),
-                        );
                     });
                 if self.local_config.stream != prev_stream {
                     self.send_config();
@@ -548,152 +566,118 @@ impl eframe::App for App {
             });
 
             ui.horizontal(|ui| {
-                // View toggle
-                ui.selectable_value(&mut self.view_mode, ViewMode::Cameras, "Cameras");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Scene, "3D Scene");
-
-                // Location lock (only relevant in Scene mode)
-                if self.view_mode == ViewMode::Scene && !self.tracking.is_empty() {
-                    ui.separator();
-                    ui.label("Lock to:");
-
-                    let selected_label = match &self.locked_location {
-                        Some(name) => name.chars().take(8).collect::<String>(),
-                        None => "Free".to_string(),
-                    };
-
-                    egui::ComboBox::from_id_salt("location_lock")
-                        .selected_text(selected_label)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.locked_location, None, "Free");
-                            let names: Vec<String> =
-                                self.tracking.iter().map(|p| p.name.clone()).collect();
-                            for name in names {
-                                let label = name.chars().take(8).collect::<String>();
-                                ui.selectable_value(
-                                    &mut self.locked_location,
-                                    Some(name.clone()),
-                                    label,
-                                );
-                            }
-                        });
-                } else if self.view_mode == ViewMode::Cameras {
-                    // Clear lock when switching away from scene view
-                    self.locked_location = None;
-                }
+                ui.checkbox(&mut self.show_cameras, "Cameras");
+                ui.checkbox(&mut self.show_scene, "3D Scene");
+                ui.checkbox(&mut self.show_patterns, "Patterns");
             });
         });
 
-        // Central panel — show either camera feeds or 3D scene
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.view_mode {
-                ViewMode::Cameras => {
+        // Background panel (egui requires a CentralPanel)
+        egui::CentralPanel::default().show(ctx, |_ui| {});
+
+        // ── Cameras window ────────────────────────────────────────
+        egui::Window::new("Cameras")
+            .default_size([640.0, 400.0])
+            .default_pos([10.0, 80.0])
+            .open(&mut self.show_cameras)
+            .show(ctx, |ui| {
+                    let show_rgb = matches!(self.active_config.stream, StreamSelection::Rgb);
+                    let show_ir = matches!(self.active_config.stream, StreamSelection::Ir);
+                    let num_panels = show_rgb as u32 + show_ir as u32;
+
                     ui.horizontal(|ui| {
                         let available = ui.available_size();
-                        let panel_width = (available.x - 20.0) / 3.0; // 3 feeds with separators
+                        let panel_width = if num_panels > 0 {
+                            (available.x - 10.0 * (num_panels - 1) as f32) / num_panels as f32
+                        } else {
+                            available.x
+                        };
 
-                        // RGB feed with face overlay
-                        ui.vertical(|ui| {
-                            ui.label("RGB + Face");
-                            if let Some(tex) = &self.rgb_texture {
-                                let aspect = self.rgb_size[1] as f32 / self.rgb_size[0] as f32;
-                                let display_h = panel_width * aspect;
-                                let display_size = egui::vec2(panel_width, display_h);
+                        if show_rgb {
+                            ui.vertical(|ui| {
+                                ui.label("RGB + Face");
+                                if let Some(tex) = &self.rgb_texture {
+                                    let aspect = self.rgb_size[1] as f32 / self.rgb_size[0] as f32;
+                                    let display_h = panel_width * aspect;
+                                    let display_size = egui::vec2(panel_width, display_h);
 
-                                let (rect, _response) =
-                                    ui.allocate_exact_size(display_size, egui::Sense::hover());
+                                    let (rect, _response) =
+                                        ui.allocate_exact_size(display_size, egui::Sense::hover());
 
-                                ui.painter().image(
-                                    tex.id(),
-                                    rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
+                                    ui.painter().image(
+                                        tex.id(),
+                                        rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
 
-                                let scale_x = rect.width() / self.rgb_size[0] as f32;
-                                let scale_y = rect.height() / self.rgb_size[1] as f32;
-                                overlay::draw_faces(
-                                    ui.painter(),
-                                    &self.latest_rgb_faces,
-                                    rect.left_top(),
-                                    scale_x,
-                                    scale_y,
-                                );
-                            } else {
-                                ui.label("Waiting for camera...");
+                                    let scale_x = rect.width() / self.rgb_size[0] as f32;
+                                    let scale_y = rect.height() / self.rgb_size[1] as f32;
+                                    overlay::draw_faces(
+                                        ui.painter(),
+                                        &self.latest_rgb_faces,
+                                        rect.left_top(),
+                                        scale_x,
+                                        scale_y,
+                                    );
+                                } else {
+                                    ui.label("Waiting for camera...");
+                                }
+                            });
+
+                            if show_ir {
+                                ui.separator();
                             }
-                        });
+                        }
 
-                        ui.separator();
+                        if show_ir {
+                            ui.vertical(|ui| {
+                                ui.label("IR + Face");
+                                if let Some(tex) = &self.ir_texture {
+                                    let aspect = self.ir_size[1] as f32 / self.ir_size[0] as f32;
+                                    let display_h = panel_width * aspect;
+                                    let display_size = egui::vec2(panel_width, display_h);
 
-                        // IR feed with face overlay
-                        ui.vertical(|ui| {
-                            ui.label("IR + Face");
-                            if let Some(tex) = &self.ir_texture {
-                                let aspect = self.ir_size[1] as f32 / self.ir_size[0] as f32;
-                                let display_h = panel_width * aspect;
-                                let display_size = egui::vec2(panel_width, display_h);
+                                    let (rect, _response) =
+                                        ui.allocate_exact_size(display_size, egui::Sense::hover());
 
-                                let (rect, _response) =
-                                    ui.allocate_exact_size(display_size, egui::Sense::hover());
+                                    ui.painter().image(
+                                        tex.id(),
+                                        rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
 
-                                ui.painter().image(
-                                    tex.id(),
-                                    rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-
-                                let scale_x = rect.width() / self.ir_size[0] as f32;
-                                let scale_y = rect.height() / self.ir_size[1] as f32;
-                                overlay::draw_faces(
-                                    ui.painter(),
-                                    &self.latest_ir_faces,
-                                    rect.left_top(),
-                                    scale_x,
-                                    scale_y,
-                                );
-                            } else {
-                                ui.label("Waiting for camera...");
-                            }
-                        });
-
-                        ui.separator();
-
-                        // Depth feed
-                        ui.vertical(|ui| {
-                            ui.label("Depth");
-                            if let Some(tex) = &self.depth_texture {
-                                let aspect = self.depth_size[1] as f32 / self.depth_size[0] as f32;
-                                let display_h = panel_width * aspect;
-                                let display_size = egui::vec2(panel_width, display_h);
-
-                                let (rect, _response) =
-                                    ui.allocate_exact_size(display_size, egui::Sense::hover());
-
-                                ui.painter().image(
-                                    tex.id(),
-                                    rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            } else {
-                                ui.label("Waiting for camera...");
-                            }
-                        });
+                                    let scale_x = rect.width() / self.ir_size[0] as f32;
+                                    let scale_y = rect.height() / self.ir_size[1] as f32;
+                                    overlay::draw_faces(
+                                        ui.painter(),
+                                        &self.latest_ir_faces,
+                                        rect.left_top(),
+                                        scale_x,
+                                        scale_y,
+                                    );
+                                } else {
+                                    ui.label("Waiting for camera...");
+                                }
+                            });
+                        }
                     });
-                }
+            });
 
-                ViewMode::Scene => {
+        // ── 3D Scene window ───────────────────────────────────────
+        egui::Window::new("3D Scene")
+            .default_size([600.0, 500.0])
+            .default_pos([660.0, 80.0])
+            .open(&mut self.show_scene)
+            .vscroll(false)
+            .show(ctx, |ui| {
                     // ── Calibration side panel ────────────────────────────────
                     egui::SidePanel::right("calib_panel")
                         .resizable(false)
@@ -706,6 +690,32 @@ impl eframe::App for App {
                                 self.camera_id.clone()
                             };
                             ui.small(format!("Camera: {}", cam_label));
+
+                            // Location lock
+                            if !self.tracking.is_empty() {
+                                ui.separator();
+                                ui.label("Lock to:");
+                                let selected_label = match &self.locked_location {
+                                    Some(name) => name.chars().take(8).collect::<String>(),
+                                    None => "Free".to_string(),
+                                };
+                                egui::ComboBox::from_id_salt("location_lock")
+                                    .selected_text(selected_label)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.locked_location, None, "Free");
+                                        let names: Vec<String> =
+                                            self.tracking.iter().map(|p| p.name.clone()).collect();
+                                        for name in names {
+                                            let label = name.chars().take(8).collect::<String>();
+                                            ui.selectable_value(
+                                                &mut self.locked_location,
+                                                Some(name.clone()),
+                                                label,
+                                            );
+                                        }
+                                    });
+                            }
+
                             ui.separator();
 
                             ui.checkbox(&mut self.calib_mode, "Calibration mode");
@@ -1021,11 +1031,19 @@ impl eframe::App for App {
                         Some(egui::pos2(cx + scale * fx / w, cy - scale * fy / w))
                     };
 
-                    // LEDs — small gray dots
-                    for led in &self.leds {
+                    // LEDs — colored when renderer is active, dim gray otherwise
+                    let has_colors = self.led_colors.len() == self.leds.len()
+                        && !self.leds.is_empty();
+                    for (i, led) in self.leds.iter().enumerate() {
                         if let Some(p) = project(led.x, led.y, led.z) {
                             if rect.contains(p) {
-                                painter.circle_filled(p, 2.0, egui::Color32::from_gray(160));
+                                let color = if has_colors {
+                                    let [r, g, b] = self.led_colors[i];
+                                    egui::Color32::from_rgb(r, g, b)
+                                } else {
+                                    egui::Color32::from_gray(60)
+                                };
+                                painter.circle_filled(p, 3.0, color);
                             }
                         }
                     }
@@ -1204,11 +1222,348 @@ impl eframe::App for App {
                         egui::FontId::proportional(11.0),
                         egui::Color32::from_gray(100),
                     );
-                }
-            }
-        });
+            });
 
-        // Request continuous repaint for live video
-        ctx.request_repaint();
+        // ── Patterns window ───────────────────────────────────────
+        egui::Window::new("Patterns")
+            .default_size([700.0, 500.0])
+            .default_pos([10.0, 490.0])
+            .open(&mut self.show_patterns)
+            .show(ctx, |ui| {
+                    // ── Collect deferred actions (avoids borrow conflicts) ─────
+                    let mut select_idx: Option<usize> = None;
+                    let mut create_new: Option<String> = None; // name for a brand-new draft
+                    let mut delete_name: Option<String> = None;
+                    let mut save_pattern: Option<Pattern> = None; // POST new
+                    let mut save_update: Option<(String, PatternUpdate)> = None; // PUT existing
+                    let mut activate_name: Option<String> = None;
+
+                    // ── Left panel: pattern list ───────────────────────────────
+                    egui::SidePanel::left("patterns_list")
+                        .resizable(false)
+                        .default_width(200.0)
+                        .show_inside(ui, |ui| {
+                            ui.heading("Patterns");
+                            ui.separator();
+
+                            let list_height = (ui.available_height() - 52.0).max(40.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("patterns_scroll")
+                                .max_height(list_height)
+                                .show(ui, |ui| {
+                                    for (i, pattern) in self.patterns.iter().enumerate() {
+                                        let is_active = pattern.name == self.active_pattern;
+                                        let is_selected = self
+                                            .pattern_editing
+                                            .as_ref()
+                                            .map(|d| d.original_name == pattern.name)
+                                            .unwrap_or(false);
+
+                                        ui.horizontal(|ui| {
+                                            // Active indicator dot
+                                            let dot_color = if is_active {
+                                                egui::Color32::from_rgb(80, 220, 100)
+                                            } else {
+                                                egui::Color32::from_gray(55)
+                                            };
+                                            ui.colored_label(dot_color, "●");
+
+                                            let text_color = if !pattern.enabled {
+                                                egui::Color32::from_gray(110)
+                                            } else if is_active {
+                                                egui::Color32::from_rgb(80, 220, 100)
+                                            } else {
+                                                egui::Color32::WHITE
+                                            };
+                                            let label = egui::RichText::new(&pattern.name)
+                                                .color(text_color);
+                                            if ui.selectable_label(is_selected, label).clicked() {
+                                                select_idx = Some(i);
+                                            }
+                                        });
+                                    }
+                                });
+
+                            ui.separator();
+
+                            // Create new pattern
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.pattern_new_name)
+                                        .hint_text("new name…")
+                                        .desired_width(110.0),
+                                );
+                                let can_create =
+                                    is_valid_pattern_name(self.pattern_new_name.trim());
+                                if ui
+                                    .add_enabled(can_create, egui::Button::new("New"))
+                                    .clicked()
+                                {
+                                    create_new =
+                                        Some(self.pattern_new_name.trim().to_string());
+                                }
+                            });
+                        });
+
+                    // ── Editor (remaining space) ───────────────────────────────
+                    if let Some(ref mut draft) = self.pattern_editing {
+                        ui.add_space(4.0);
+
+                        // Header row
+                        ui.horizontal(|ui| {
+                            ui.label("Name:");
+                            if draft.is_new {
+                                let name_valid = is_valid_pattern_name(draft.name.trim());
+                                let te = egui::TextEdit::singleline(&mut draft.name)
+                                    .desired_width(160.0);
+                                let resp = ui.add(te);
+                                if !name_valid && resp.lost_focus() {
+                                    ui.colored_label(
+                                        egui::Color32::RED,
+                                        "letters, digits, _ or - only",
+                                    );
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(&draft.original_name)
+                                        .strong()
+                                        .monospace(),
+                                );
+                                if self.active_pattern == draft.original_name {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(80, 220, 100),
+                                        "(active)",
+                                    );
+                                }
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut draft.enabled, "Enabled");
+                            ui.checkbox(&mut draft.overscan, "Overscan");
+                        });
+
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("GLSL Fragment Shader")
+                                .small()
+                                .color(egui::Color32::from_gray(160)),
+                        );
+
+                        // Code editor — fills space above the button row
+                        let code_height = (ui.available_height() - 42.0).max(60.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("glsl_edit_scroll")
+                            .max_height(code_height)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut draft.glsl)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(24),
+                                );
+                            });
+
+                        ui.separator();
+
+                        // Action buttons
+                        ui.horizontal(|ui| {
+                            let save_label = if draft.is_new { "Create" } else { "Save" };
+                            let can_save = if draft.is_new {
+                                is_valid_pattern_name(draft.name.trim())
+                            } else {
+                                true
+                            };
+                            if ui.add_enabled(can_save, egui::Button::new(save_label)).clicked()
+                            {
+                                if draft.is_new {
+                                    save_pattern = Some(Pattern {
+                                        name: draft.name.trim().to_string(),
+                                        glsl_code: draft.glsl.clone(),
+                                        enabled: draft.enabled,
+                                        overscan: draft.overscan,
+                                    });
+                                    // Transition to edit mode for the just-created pattern.
+                                    draft.original_name = draft.name.trim().to_string();
+                                    draft.is_new = false;
+                                } else {
+                                    save_update = Some((
+                                        draft.original_name.clone(),
+                                        PatternUpdate {
+                                            glsl_code: draft.glsl.clone(),
+                                            enabled: draft.enabled,
+                                            overscan: draft.overscan,
+                                        },
+                                    ));
+                                }
+                            }
+
+                            if !draft.is_new {
+                                let is_active = self.active_pattern == draft.original_name;
+                                if is_active {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(80, 220, 100),
+                                        "● Active",
+                                    );
+                                } else if ui.button("Activate").clicked() {
+                                    activate_name = Some(draft.original_name.clone());
+                                }
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .button(
+                                                egui::RichText::new("Delete")
+                                                    .color(egui::Color32::from_rgb(220, 80, 80)),
+                                            )
+                                            .clicked()
+                                        {
+                                            delete_name =
+                                                Some(draft.original_name.clone());
+                                        }
+                                    },
+                                );
+                            }
+                        });
+                    } else {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(80.0);
+                            ui.label(
+                                egui::RichText::new("Select a pattern or create a new one")
+                                    .color(egui::Color32::from_gray(100)),
+                            );
+                        });
+                    }
+
+                    // ── Apply deferred actions ─────────────────────────────────
+                    if let Some(i) = select_idx {
+                        let p = &self.patterns[i];
+                        self.pattern_editing = Some(PatternDraft {
+                            original_name: p.name.clone(),
+                            name: p.name.clone(),
+                            glsl: p.glsl_code.clone(),
+                            enabled: p.enabled,
+                            overscan: p.overscan,
+                            is_new: false,
+                        });
+                    }
+
+                    if let Some(name) = create_new {
+                        self.pattern_editing = Some(PatternDraft {
+                            original_name: name.clone(),
+                            name: name.clone(),
+                            glsl: DEFAULT_PATTERN_GLSL.to_string(),
+                            enabled: true,
+                            overscan: false,
+                            is_new: true,
+                        });
+                        self.pattern_new_name = String::new();
+                    }
+
+                    if let Some(name) = delete_name {
+                        self.pattern_editing = None;
+                        let pp = self.patterns_pending.clone();
+                        let ap = self.active_pattern_pending.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let url = format!("/api/patterns/{}", name);
+                            if let Ok(resp) =
+                                gloo_net::http::Request::delete(&url).send().await
+                            {
+                                if resp.status() == 204 {
+                                    if let Ok(r) =
+                                        gloo_net::http::Request::get("/api/patterns")
+                                            .send()
+                                            .await
+                                    {
+                                        if let Ok(list) = r.json::<Vec<Pattern>>().await {
+                                            *pp.borrow_mut() = Some(list);
+                                        }
+                                    }
+                                    if let Ok(r) =
+                                        gloo_net::http::Request::get("/api/patterns/active")
+                                            .send()
+                                            .await
+                                    {
+                                        if r.status() == 200 {
+                                            if let Ok(active) = r.text().await {
+                                                *ap.borrow_mut() = Some(active);
+                                            }
+                                        } else {
+                                            *ap.borrow_mut() = Some(String::new());
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    if let Some(pattern) = save_pattern {
+                        let pp = self.patterns_pending.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Ok(resp) = gloo_net::http::Request::post("/api/patterns")
+                                .json(&pattern)
+                                .expect("serialize Pattern")
+                                .send()
+                                .await
+                            {
+                                if resp.status() == 201 || resp.status() == 200 {
+                                    if let Ok(r) =
+                                        gloo_net::http::Request::get("/api/patterns")
+                                            .send()
+                                            .await
+                                    {
+                                        if let Ok(list) = r.json::<Vec<Pattern>>().await {
+                                            *pp.borrow_mut() = Some(list);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    if let Some((name, update)) = save_update {
+                        let pp = self.patterns_pending.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let url = format!("/api/patterns/{}", name);
+                            if let Ok(resp) = gloo_net::http::Request::put(&url)
+                                .json(&update)
+                                .expect("serialize PatternUpdate")
+                                .send()
+                                .await
+                            {
+                                if resp.status() == 204 {
+                                    if let Ok(r) =
+                                        gloo_net::http::Request::get("/api/patterns")
+                                            .send()
+                                            .await
+                                    {
+                                        if let Ok(list) = r.json::<Vec<Pattern>>().await {
+                                            *pp.borrow_mut() = Some(list);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    if let Some(name) = activate_name {
+                        let ap = self.active_pattern_pending.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let url = format!("/api/patterns/{}/activate", name);
+                            if let Ok(resp) =
+                                gloo_net::http::Request::post(&url).send().await
+                            {
+                                if resp.status() == 204 {
+                                    *ap.borrow_mut() = Some(name);
+                                }
+                            }
+                        });
+                    }
+            });
+
+        // Repaint at ~30 fps (matches camera input rate; avoids rendering
+        // all three windows at 60 fps which is unnecessarily expensive).
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 }

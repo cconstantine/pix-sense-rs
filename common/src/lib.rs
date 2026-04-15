@@ -38,7 +38,6 @@ pub enum DetectionAlgo {
 pub enum StreamSelection {
     Rgb,
     Ir,
-    Both,
 }
 
 /// Runtime detection configuration — shared between server and client.
@@ -52,7 +51,7 @@ impl Default for DetectionConfig {
     fn default() -> Self {
         Self {
             algo: DetectionAlgo::YoloHead,
-            stream: StreamSelection::Both,
+            stream: StreamSelection::Rgb,
         }
     }
 }
@@ -64,7 +63,6 @@ pub struct FrameMetadata {
     pub ir_faces: Vec<FaceDetection>,
     pub rgb_size: [u32; 2],
     pub ir_size: [u32; 2],
-    pub depth_size: [u32; 2],
     /// The algorithm + stream configuration that was active when this frame was processed.
     pub active_config: DetectionConfig,
 }
@@ -72,7 +70,6 @@ pub struct FrameMetadata {
 /// Binary message format:
 ///   [u32 LE: rgb_jpeg_len][rgb_jpeg bytes]
 ///   [u32 LE: ir_jpeg_len][ir_jpeg bytes]
-///   [u32 LE: depth_jpeg_len][depth_jpeg bytes]
 ///   [remaining bytes: JSON of FrameMetadata]
 
 /// A single LED physical position in camera-frame metres (X=right, Y=down, Z=forward).
@@ -90,6 +87,20 @@ pub struct TrackingPoint {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+}
+
+/// Tagged text message sent from server to WebSocket clients.
+/// Serialises as `{"type":"tracking","data":[...]}` etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ServerMessage {
+    /// Live person tracking locations.
+    Tracking(Vec<TrackingPoint>),
+    /// Current RGB color for each LED, in the same order as `/api/leds`.
+    LedColors(Vec<[u8; 3]>),
+    /// Active detection config — sent to new clients on connect so the UI
+    /// reflects the persisted server-side setting immediately.
+    Config(DetectionConfig),
 }
 
 /// Camera extrinsic transform: p_world = R * p_cam + t
@@ -125,27 +136,41 @@ pub struct CalibrationPoint {
     pub world: [f32; 3],
 }
 
+/// A GLSL shader pattern for LED visualisation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Pattern {
+    pub name: String,
+    pub glsl_code: String,
+    pub enabled: bool,
+    pub overscan: bool,
+}
+
+/// Fields that can be updated on an existing pattern (name is immutable after creation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternUpdate {
+    pub glsl_code: String,
+    pub enabled: bool,
+    pub overscan: bool,
+}
+
 pub fn encode_frame_message(
     rgb_jpeg: &[u8],
     ir_jpeg: &[u8],
-    depth_jpeg: &[u8],
     metadata: &FrameMetadata,
 ) -> Vec<u8> {
     let json = serde_json::to_vec(metadata).expect("failed to serialize metadata");
     let mut msg =
-        Vec::with_capacity(12 + rgb_jpeg.len() + ir_jpeg.len() + depth_jpeg.len() + json.len());
+        Vec::with_capacity(8 + rgb_jpeg.len() + ir_jpeg.len() + json.len());
     msg.extend_from_slice(&(rgb_jpeg.len() as u32).to_le_bytes());
     msg.extend_from_slice(rgb_jpeg);
     msg.extend_from_slice(&(ir_jpeg.len() as u32).to_le_bytes());
     msg.extend_from_slice(ir_jpeg);
-    msg.extend_from_slice(&(depth_jpeg.len() as u32).to_le_bytes());
-    msg.extend_from_slice(depth_jpeg);
     msg.extend_from_slice(&json);
     msg
 }
 
-pub fn decode_frame_message(data: &[u8]) -> Option<(&[u8], &[u8], &[u8], FrameMetadata)> {
-    if data.len() < 12 {
+pub fn decode_frame_message(data: &[u8]) -> Option<(&[u8], &[u8], FrameMetadata)> {
+    if data.len() < 8 {
         return None;
     }
 
@@ -158,22 +183,14 @@ pub fn decode_frame_message(data: &[u8]) -> Option<(&[u8], &[u8], &[u8], FrameMe
     let rest = &data[4 + rgb_len..];
 
     let ir_len = u32::from_le_bytes(rest[0..4].try_into().ok()?) as usize;
-    if rest.len() < 4 + ir_len + 4 {
+    if rest.len() < 4 + ir_len {
         return None;
     }
 
     let ir_jpeg = &rest[4..4 + ir_len];
-    let rest = &rest[4 + ir_len..];
-
-    let depth_len = u32::from_le_bytes(rest[0..4].try_into().ok()?) as usize;
-    if rest.len() < 4 + depth_len {
-        return None;
-    }
-
-    let depth_jpeg = &rest[4..4 + depth_len];
-    let json_bytes = &rest[4 + depth_len..];
+    let json_bytes = &rest[4 + ir_len..];
 
     let metadata: FrameMetadata = serde_json::from_slice(json_bytes).ok()?;
 
-    Some((rgb_jpeg, ir_jpeg, depth_jpeg, metadata))
+    Some((rgb_jpeg, ir_jpeg, metadata))
 }

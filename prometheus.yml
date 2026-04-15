@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: pix-sense
+    static_configs:
+      - targets: ["dev:3000"]

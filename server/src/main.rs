@@ -1,6 +1,7 @@
 mod camera;
 mod db;
 mod face;
+mod renderer;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -9,7 +10,7 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
     },
     http::StatusCode,
     response::IntoResponse,
@@ -19,11 +20,16 @@ use axum::{
 use image::RgbImage;
 use pix_sense_common::{
     encode_frame_message, CalibrationPoint, CameraExtrinsics, DetectionConfig, FaceDetection,
-    FrameMetadata, LedPoint, TrackingPoint,
+    FrameMetadata, LedPoint, Pattern, PatternUpdate, ServerMessage, TrackingPoint,
 };
 use sqlx::{PgPool, Row as _};
 use tokio::sync::{broadcast, watch};
 use tower_http::services::ServeDir;
+
+use prometheus::{
+    register_gauge_vec, register_histogram, register_histogram_vec, register_int_counter,
+    Encoder, GaugeVec, Histogram, HistogramVec, IntCounter, TextEncoder,
+};
 
 use camera::{Camera, CameraIntrinsics};
 use face::{FaceDetector, HeadDetector};
@@ -31,12 +37,63 @@ use face::{FaceDetector, HeadDetector};
 const SCRFD_MODEL_PATH: &str = "models/scrfd_10g_bnkps.onnx";
 const YOLO_HEAD_MODEL_PATH: &str = "models/yolov8n_head.onnx";
 
+// ---------------------------------------------------------------------------
+// Prometheus metrics
+// ---------------------------------------------------------------------------
+
+const TIMING_BUCKETS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0];
+
+struct Metrics {
+    frame_count: IntCounter,
+    frame_time_ms: Histogram,
+    capture_time_ms: Histogram,
+    pipeline_ms: HistogramVec,
+    heads_detected: GaugeVec,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let opts = |name: &str, help: &str| {
+            prometheus::HistogramOpts::new(name, help).buckets(TIMING_BUCKETS.to_vec())
+        };
+        Self {
+            frame_count: register_int_counter!(
+                "pix_frame_count_total",
+                "Total number of frames processed"
+            )
+            .unwrap(),
+            frame_time_ms: register_histogram!(opts(
+                "pix_frame_time_ms",
+                "Total frame processing time in milliseconds"
+            ))
+            .unwrap(),
+            capture_time_ms: register_histogram!(opts(
+                "pix_capture_time_ms",
+                "Camera capture time in milliseconds"
+            ))
+            .unwrap(),
+            pipeline_ms: register_histogram_vec!(
+                opts(
+                    "pix_pipeline_stage_ms",
+                    "Pipeline stage duration in milliseconds"
+                ),
+                &["stream", "stage"]
+            )
+            .unwrap(),
+            heads_detected: register_gauge_vec!(
+                "pix_heads_detected",
+                "Number of heads detected per frame",
+                &["stream"]
+            )
+            .unwrap(),
+        }
+    }
+}
+
 /// Data produced by the processing thread
 struct FrameData {
     rgb: RgbImage,
     ir: image::GrayImage,
-    depth: image::GrayImage,
-    depth_size: [u32; 2],
     rgb_faces: Vec<FaceDetection>,
     ir_faces: Vec<FaceDetection>,
     active_config: DetectionConfig,
@@ -48,12 +105,19 @@ struct AppState {
     config: Arc<RwLock<DetectionConfig>>,
     db_pool: Option<PgPool>,
     tracking_tx: broadcast::Sender<String>,
+    /// Latest tracked person world position forwarded to the GL renderer.
+    #[allow(dead_code)] // kept in AppState to own the sender; all reads go through tracking_listener
+    tracking_pos_tx: watch::Sender<Option<[f32; 3]>>,
+    /// Latest LED color frame from the renderer, pre-serialised as JSON for WebSocket broadcast.
+    led_colors_rx: watch::Receiver<Option<String>>,
     /// Current camera extrinsics (applied to all depth detections). None = identity (camera at origin).
     extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
     /// Calibration point pairs collected in this session (in-memory, not persisted).
     calib_points: Arc<Mutex<Vec<CalibrationPoint>>>,
     /// RealSense serial number — used as the DB key for extrinsics.
     camera_id: Arc<String>,
+    /// Sculpture name from SCULPTURE_NAME env var — used for pattern activation.
+    sculpture_name: Arc<String>,
 }
 
 #[tokio::main]
@@ -69,8 +133,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    let config = Arc::new(RwLock::new(DetectionConfig::default()));
-
     // Query camera serial number before starting the full pipeline.
     let camera_id = Arc::new(
         camera::query_serial().unwrap_or_else(|| {
@@ -82,6 +144,19 @@ async fn main() -> Result<()> {
 
     // Connect to postgres (optional — runs without DB if DATABASE_URL is unset)
     let db_pool = db::connect().await;
+
+    // Load persisted detection config from DB, falling back to defaults if unavailable.
+    let initial_config = if let Some(pool) = &db_pool {
+        db::load_detection_config(pool).await.unwrap_or_default()
+    } else {
+        DetectionConfig::default()
+    };
+    tracing::info!(
+        "Detection config: algo={:?} stream={:?}",
+        initial_config.algo,
+        initial_config.stream
+    );
+    let config = Arc::new(RwLock::new(initial_config));
 
     // Watch channel for broadcasting the latest encoded frame to all WebSocket clients
     let (frame_tx, frame_rx) = watch::channel(Arc::new(Vec::new()));
@@ -119,14 +194,17 @@ async fn main() -> Result<()> {
 
     let calib_points: Arc<Mutex<Vec<CalibrationPoint>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let metrics = Arc::new(Metrics::new());
+
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     let config_clone = config.clone();
     let extrinsics_clone = extrinsics.clone();
+    let metrics_clone = metrics.clone();
 
     // Spawn camera + face detection thread (blocking, runs on a std::thread)
     let handle = std::thread::spawn(move || {
-        if let Err(e) = processing_thread(frame_tx, &running_clone, config_clone, db_tx, extrinsics_clone) {
+        if let Err(e) = processing_thread(frame_tx, &running_clone, config_clone, db_tx, extrinsics_clone, metrics_clone) {
             tracing::error!("Processing thread error: {:#}", e);
         }
     });
@@ -141,13 +219,39 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Watch channel for broadcasting the latest tracked person position to the GL renderer.
+    let (tracking_pos_tx, tracking_pos_rx) = watch::channel::<Option<[f32; 3]>>(None);
+
+    // Watch channel for broadcasting LED colors from the renderer to WebSocket clients.
+    // Value is pre-serialised JSON so the WS handler can forward it directly.
+    let (led_colors_tx, led_colors_rx) = watch::channel::<Option<String>>(None);
+
     // Spawn PgListener task that forwards tracking_location NOTIFYs to WebSocket clients
+    // and updates the tracking position watch channel for the renderer.
     if let Some(pool) = &db_pool {
         let pool = pool.clone();
-        let tx = tracking_tx.clone();
+        let ws_tx = tracking_tx.clone();
+        let pos_tx = tracking_pos_tx.clone();
         tokio::spawn(async move {
-            tracking_listener(pool, tx).await;
+            tracking_listener(pool, ws_tx, pos_tx).await;
         });
+    }
+
+    let sculpture_name = Arc::new(
+        std::env::var("SCULPTURE_NAME").unwrap_or_else(|_| "default".to_string()),
+    );
+    tracing::info!("Sculpture name: {}", sculpture_name);
+
+    // Spawn the headless GLSL renderer thread (requires DB to be configured).
+    if let Some(pool) = &db_pool {
+        let pool = pool.clone();
+        let rx = tracking_pos_rx;
+        let sname = (*sculpture_name).clone();
+        let running_r = running.clone();
+        std::thread::Builder::new()
+            .name("gl-renderer".into())
+            .spawn(move || renderer::run(pool, rx, led_colors_tx, running_r, sname))
+            .expect("spawn gl-renderer thread");
     }
 
     let state = AppState {
@@ -155,9 +259,12 @@ async fn main() -> Result<()> {
         config,
         db_pool,
         tracking_tx,
+        tracking_pos_tx,
+        led_colors_rx,
         extrinsics,
         calib_points,
         camera_id,
+        sculpture_name,
     };
 
     let app = Router::new()
@@ -177,6 +284,20 @@ async fn main() -> Result<()> {
                 .delete(clear_points_handler),
         )
         .route("/api/calibration/compute", post(compute_extrinsics_handler))
+        // Pattern management
+        .route(
+            "/api/patterns",
+            get(list_patterns_handler).post(create_pattern_handler),
+        )
+        .route("/api/patterns/active", get(get_active_pattern_handler))
+        .route(
+            "/api/patterns/{name}",
+            get(get_pattern_handler)
+                .put(update_pattern_handler)
+                .delete(delete_pattern_handler),
+        )
+        .route("/api/patterns/{name}/activate", post(activate_pattern_handler))
+        .route("/metrics", get(metrics_handler))
         .fallback_service(ServeDir::new("client/dist"))
         .with_state(state);
 
@@ -198,7 +319,16 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     tracing::info!("New WebSocket connection");
     let tracking_rx = state.tracking_tx.subscribe();
-    ws.on_upgrade(|socket| handle_ws(socket, state.frame_rx, state.config, tracking_rx))
+    ws.on_upgrade(|socket| {
+        handle_ws(
+            socket,
+            state.frame_rx,
+            state.config,
+            tracking_rx,
+            state.led_colors_rx,
+            state.db_pool,
+        )
+    })
 }
 
 async fn handle_ws(
@@ -206,10 +336,26 @@ async fn handle_ws(
     mut rx: watch::Receiver<Arc<Vec<u8>>>,
     config: Arc<RwLock<DetectionConfig>>,
     mut tracking_rx: broadcast::Receiver<String>,
+    mut led_colors_rx: watch::Receiver<Option<String>>,
+    db_pool: Option<PgPool>,
 ) {
+    // Send the current detection config immediately so the client UI reflects
+    // the persisted setting rather than its hard-coded default.
+    // Copy out of the lock guard before awaiting (guard is !Send across await).
+    let current_config = *config.read().unwrap();
+    if let Ok(json) = serde_json::to_string(&ServerMessage::Config(current_config)) {
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
+    // Once the renderer's sender is dropped, stop polling that arm rather than
+    // disconnecting the client (which would break frame/tracking delivery too).
+    let mut led_colors_closed = false;
+
     loop {
         tokio::select! {
-            // New frame available — forward to client
+            // New camera frame available — forward as binary
             changed = rx.changed() => {
                 if changed.is_err() {
                     break; // sender dropped
@@ -228,6 +374,22 @@ async fn handle_ws(
                     break; // client disconnected
                 }
             }
+            // LED color update from renderer — forward as JSON text.
+            // Guard disabled once the renderer sender is gone so this arm doesn't
+            // spin-loop on a permanently-closed channel and starve the others.
+            changed = led_colors_rx.changed(), if !led_colors_closed => {
+                if changed.is_err() {
+                    led_colors_closed = true; // renderer stopped; skip this arm hereafter
+                } else {
+                    // Clone out of the guard before awaiting (guard is not Send).
+                    let json = led_colors_rx.borrow_and_update().clone();
+                    if let Some(json) = json {
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
             // Message from client — handle config updates
             msg = socket.recv() => {
                 match msg {
@@ -238,6 +400,11 @@ async fn handle_ws(
                                 "Config updated: algo={:?} stream={:?}",
                                 cfg.algo, cfg.stream
                             );
+                            if let Some(pool) = db_pool.clone() {
+                                tokio::spawn(async move {
+                                    db::save_detection_config(&pool, cfg).await;
+                                });
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -250,8 +417,13 @@ async fn handle_ws(
 }
 
 /// Listens for PostgreSQL NOTIFY on `tracking_location_update`, queries fresh rows,
-/// and broadcasts the JSON-encoded list to all connected WebSocket clients.
-async fn tracking_listener(pool: PgPool, tx: broadcast::Sender<String>) {
+/// broadcasts the JSON-encoded list to all connected WebSocket clients, and updates
+/// the renderer's tracking position watch channel.
+async fn tracking_listener(
+    pool: PgPool,
+    ws_tx: broadcast::Sender<String>,
+    pos_tx: watch::Sender<Option<[f32; 3]>>,
+) {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         tracing::warn!("DATABASE_URL not set, tracking_listener exiting");
         return;
@@ -290,9 +462,15 @@ async fn tracking_listener(pool: PgPool, tx: broadcast::Sender<String>) {
                     })
                     .collect();
 
-                if let Ok(json) = serde_json::to_string(&points) {
+                // Update renderer with the first tracked position (primary person).
+                let renderer_pos = points.first().map(|p| [p.x, p.y, p.z]);
+                let _ = pos_tx.send(renderer_pos);
+
+                if let Ok(json) =
+                    serde_json::to_string(&ServerMessage::Tracking(points))
+                {
                     // Ignore error — no subscribers connected is fine
-                    let _ = tx.send(json);
+                    let _ = ws_tx.send(json);
                 }
             }
             Err(e) => {
@@ -307,10 +485,14 @@ async fn leds_handler(State(state): State<AppState>) -> impl IntoResponse {
     let Some(pool) = &state.db_pool else {
         return Json(Vec::<LedPoint>::new());
     };
-    let rows = sqlx::query("SELECT x, y, z FROM leds")
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    let rows = sqlx::query(
+        "SELECT l.x, l.y, l.z FROM leds l \
+         JOIN fadecandies f ON f.id = l.fadecandy_id \
+         ORDER BY f.id, l.idx",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
     Json(
         rows.into_iter()
             .map(|r| LedPoint {
@@ -486,12 +668,142 @@ fn compute_rigid_transform(pts: &[CalibrationPoint]) -> Result<CameraExtrinsics>
     Ok(CameraExtrinsics { r, t })
 }
 
+// ---------------------------------------------------------------------------
+// Pattern route handlers
+// ---------------------------------------------------------------------------
+
+async fn list_patterns_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return Json(Vec::<Pattern>::new()).into_response();
+    };
+    Json(db::list_patterns(pool).await).into_response()
+}
+
+async fn create_pattern_handler(
+    State(state): State<AppState>,
+    Json(pattern): Json<Pattern>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match db::create_pattern(pool, &pattern).await {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e)
+            if e.as_database_error()
+                .map(|d| d.is_unique_violation())
+                .unwrap_or(false) =>
+        {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "Pattern name already exists" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!("create_pattern error: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn get_pattern_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match db::get_pattern(pool, &name).await {
+        Some(p) => Json(p).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn update_pattern_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(update): Json<PatternUpdate>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match db::update_pattern(pool, &name, &update).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::warn!("update_pattern error: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn delete_pattern_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match db::delete_pattern(pool, &name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::warn!("delete_pattern error: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn activate_pattern_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match db::set_active_pattern(pool, &state.sculpture_name, &name).await {
+        Ok(()) => {
+            tracing::info!("Active pattern set to '{}' for sculpture '{}'", name, state.sculpture_name);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            tracing::warn!("set_active_pattern error: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn get_active_pattern_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match db::get_active_pattern(pool, &state.sculpture_name).await {
+        Some(name) => name.into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+async fn metrics_handler() -> impl IntoResponse {
+    let encoder = TextEncoder::new();
+    let families = prometheus::gather();
+    let mut buf = Vec::new();
+    encoder.encode(&families, &mut buf).unwrap();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            encoder.format_type().to_owned(),
+        )],
+        buf,
+    )
+}
+
 fn processing_thread(
     tx: watch::Sender<Arc<Vec<u8>>>,
     running: &AtomicBool,
     config: Arc<RwLock<DetectionConfig>>,
     db_tx: tokio::sync::mpsc::UnboundedSender<Vec<[f32; 3]>>,
     extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
+    metrics: Arc<Metrics>,
 ) -> Result<()> {
     // Load models first — CUDA graph compilation can take a while,
     // and the RealSense pipeline may stall if frames aren't consumed.
@@ -517,9 +829,6 @@ fn processing_thread(
     let encode_handle = std::thread::spawn(move || {
         encode_thread(frame_rx, tx, &encode_running_clone);
     });
-
-    let mut frame_count = 0u64;
-    let mut log_interval = std::time::Instant::now();
 
     while running.load(Ordering::Relaxed) {
         let t_loop = std::time::Instant::now();
@@ -591,8 +900,6 @@ fn processing_thread(
         let data = FrameData {
             rgb: frames.rgb,
             ir: frames.ir,
-            depth: frames.depth,
-            depth_size: frames.depth_size,
             rgb_faces,
             ir_faces,
             active_config: cfg,
@@ -603,28 +910,26 @@ fn processing_thread(
         }
 
         let detect_ms = t_loop.elapsed().as_secs_f64() * 1000.0;
-        frame_count += 1;
 
-        // Log timing every 2 seconds
-        if log_interval.elapsed().as_secs_f64() >= 2.0 {
-            tracing::info!(
-                "frame {} total={:.1}ms ({:.1} fps)  capture={:.1}ms  algo={:?}  stream={:?}",
-                frame_count, detect_ms, 1000.0 / detect_ms, capture_ms,
-                cfg.algo, cfg.stream,
-            );
-            if let Some(t) = &timing {
-                tracing::info!(
-                    "  RGB: pre={:.1}ms  trt={:.1}ms  post={:.1}ms  heads={}  scrfd={:.1}ms  total={:.1}ms",
-                    t.rgb_pre_ms, t.rgb_infer_ms, t.rgb_post_ms,
-                    t.rgb_heads, t.rgb_scrfd_ms, t.rgb_total_ms,
-                );
-                tracing::info!(
-                    "  IR:  pre={:.1}ms  trt={:.1}ms  post={:.1}ms  heads={}  scrfd={:.1}ms  total={:.1}ms",
-                    t.ir_pre_ms, t.ir_infer_ms, t.ir_post_ms,
-                    t.ir_heads, t.ir_scrfd_ms, t.ir_total_ms,
-                );
-            }
-            log_interval = std::time::Instant::now();
+        // Update Prometheus metrics
+        metrics.frame_count.inc();
+        metrics.frame_time_ms.observe(detect_ms);
+        metrics.capture_time_ms.observe(capture_ms);
+
+        if let Some(t) = &timing {
+            metrics.pipeline_ms.with_label_values(&["rgb", "pre"]).observe(t.rgb_pre_ms);
+            metrics.pipeline_ms.with_label_values(&["rgb", "infer"]).observe(t.rgb_infer_ms);
+            metrics.pipeline_ms.with_label_values(&["rgb", "post"]).observe(t.rgb_post_ms);
+            metrics.pipeline_ms.with_label_values(&["rgb", "scrfd"]).observe(t.rgb_scrfd_ms);
+            metrics.pipeline_ms.with_label_values(&["rgb", "total"]).observe(t.rgb_total_ms);
+            metrics.heads_detected.with_label_values(&["rgb"]).set(t.rgb_heads as f64);
+
+            metrics.pipeline_ms.with_label_values(&["ir", "pre"]).observe(t.ir_pre_ms);
+            metrics.pipeline_ms.with_label_values(&["ir", "infer"]).observe(t.ir_infer_ms);
+            metrics.pipeline_ms.with_label_values(&["ir", "post"]).observe(t.ir_post_ms);
+            metrics.pipeline_ms.with_label_values(&["ir", "scrfd"]).observe(t.ir_scrfd_ms);
+            metrics.pipeline_ms.with_label_values(&["ir", "total"]).observe(t.ir_total_ms);
+            metrics.heads_detected.with_label_values(&["ir"]).set(t.ir_heads as f64);
         }
     }
 
@@ -669,8 +974,8 @@ fn run_detection(
     frames: &camera::CameraFrames,
     cfg: DetectionConfig,
 ) -> (Vec<FaceDetection>, Vec<FaceDetection>, Option<DetectionTiming>) {
-    let run_rgb = matches!(cfg.stream, StreamSelection::Rgb | StreamSelection::Both);
-    let run_ir = matches!(cfg.stream, StreamSelection::Ir | StreamSelection::Both);
+    let run_rgb = matches!(cfg.stream, StreamSelection::Rgb);
+    let run_ir = matches!(cfg.stream, StreamSelection::Ir);
 
     let (rgb_faces, rgb_t) = if run_rgb {
         detect_stream_rgb(head, face, &frames.rgb, cfg.algo)
@@ -875,8 +1180,8 @@ fn compute_xyz(
     let z_mm = samples[samples.len() / 2] as f32;
     let z = z_mm / 1000.0; // metres
 
-    let x = (cx_px - intr.ppx) * z / intr.fx;
-    let y = (cy_px - intr.ppy) * z / intr.fy;
+    let x = -((cx_px - intr.ppx) * z / intr.fx);
+    let y = -((cy_px - intr.ppy) * z / intr.fy);
 
     Some([x, y, z])
 }
@@ -959,24 +1264,13 @@ fn encode_frame(compressor: &mut turbojpeg::Compressor, data: &FrameData) -> Vec
         })
         .expect("JPEG encode failed");
 
-    let depth_jpeg = compressor
-        .compress_to_vec(turbojpeg::Image {
-            pixels: data.depth.as_raw().as_slice(),
-            width: data.depth.width() as usize,
-            pitch: data.depth.width() as usize,
-            height: data.depth.height() as usize,
-            format: turbojpeg::PixelFormat::GRAY,
-        })
-        .expect("JPEG encode failed");
-
     let metadata = FrameMetadata {
         rgb_faces: data.rgb_faces.clone(),
         ir_faces: data.ir_faces.clone(),
         rgb_size: [data.rgb.width(), data.rgb.height()],
         ir_size: [data.ir.width(), data.ir.height()],
-        depth_size: data.depth_size,
         active_config: data.active_config,
     };
 
-    encode_frame_message(&rgb_jpeg, &ir_jpeg, &depth_jpeg, &metadata)
+    encode_frame_message(&rgb_jpeg, &ir_jpeg, &metadata)
 }
