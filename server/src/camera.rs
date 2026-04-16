@@ -22,9 +22,9 @@ pub struct CameraIntrinsics {
 }
 
 impl Default for CameraIntrinsics {
-    /// Typical Intel RealSense D435 values at 640×480. Used as a fallback only.
+    /// Typical Intel RealSense D455 values at 1280×720. Used as a fallback only.
     fn default() -> Self {
-        Self { fx: 615.0, fy: 615.0, ppx: 320.0, ppy: 240.0 }
+        Self { fx: 1230.0, fy: 1230.0, ppx: 640.0, ppy: 360.0 }
     }
 }
 
@@ -84,13 +84,13 @@ impl Camera {
 
         let mut config = Config::new();
         config
-            .enable_stream(Rs2StreamKind::Color, None, 640, 480, Rs2Format::Rgb8, 30)
+            .enable_stream(Rs2StreamKind::Color, None, 1280, 720, Rs2Format::Rgb8, 30)
             .context("Failed to enable color stream")?;
         config
-            .enable_stream(Rs2StreamKind::Infrared, None, 640, 480, Rs2Format::Y8, 30)
+            .enable_stream(Rs2StreamKind::Infrared, None, 1280, 720, Rs2Format::Y8, 30)
             .context("Failed to enable infrared stream")?;
         config
-            .enable_stream(Rs2StreamKind::Depth, None, 640, 480, Rs2Format::Z16, 30)
+            .enable_stream(Rs2StreamKind::Depth, None, 1280, 720, Rs2Format::Z16, 30)
             .context("Failed to enable depth stream")?;
 
         let pipeline = pipeline
@@ -137,7 +137,7 @@ impl Camera {
             Err(_) => return Ok(None), // timeout, not an error
         };
 
-        // Align all streams to the infrared coordinate space
+        // Align all streams to the colour camera's coordinate space
         self.align.queue(raw_frames)
             .context("Failed to queue frames for alignment")?;
         let frames = self.align.wait(std::time::Duration::from_millis(100))
@@ -145,8 +145,8 @@ impl Camera {
 
         let mut rgb_image = None;
         let mut ir_image = None;
-        let mut rgb_w = 640u32;
-        let mut rgb_h = 480u32;
+        let mut rgb_w = 1280u32;
+        let mut rgb_h = 720u32;
 
         // Extract color frames using raw data for speed
         let color_frames = frames.frames_of_type::<ColorFrame>();
@@ -195,8 +195,8 @@ impl Camera {
         // Extract depth frames (Z16: 16-bit unsigned, millimeters)
         // Keep raw u16 values for 3-D deprojection.
         let mut depth_raw_buf: Vec<u16> = Vec::new();
-        let mut depth_w = 640u32;
-        let mut depth_h = 480u32;
+        let mut depth_w = 1280u32;
+        let mut depth_h = 720u32;
         let depth_frames = frames.frames_of_type::<DepthFrame>();
         if let Some(depth) = depth_frames.first() {
             let w = depth.width() as u32;
@@ -218,7 +218,7 @@ impl Camera {
         }
 
         let rgb = rgb_image.unwrap_or_else(|| RgbImage::new(rgb_w, rgb_h));
-        let ir = ir_image.unwrap_or_else(|| GrayImage::new(640, 480));
+        let ir = ir_image.unwrap_or_else(|| GrayImage::new(rgb_w, rgb_h));
 
         Ok(Some(CameraFrames {
             rgb,

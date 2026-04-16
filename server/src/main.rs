@@ -97,6 +97,105 @@ struct FrameData {
     rgb_faces: Vec<FaceDetection>,
     ir_faces: Vec<FaceDetection>,
     active_config: DetectionConfig,
+    roi_rect: [u32; 4],
+}
+
+// ---------------------------------------------------------------------------
+// ROI tracker — keeps the detection crop window centered on the last face
+// ---------------------------------------------------------------------------
+
+struct RoiTracker {
+    /// Smoothed crop center in full-image pixel coordinates.
+    /// `None` means scanning mode (no face tracked).
+    center: Option<(f32, f32)>,
+    /// Consecutive frames with zero detections.
+    frames_without_detection: u32,
+    /// Coast on last known position for this many misses before scanning.
+    max_coast_frames: u32,
+    /// Current index into the scan pattern (cycles through positions).
+    scan_index: usize,
+    /// EMA smoothing factor (higher = more responsive).
+    ema_alpha: f32,
+}
+
+/// Horizontal scan positions (center-x values) for a 1280-wide frame with a
+/// 640-wide crop.  Three positions tile the frame with 50 % overlap so every
+/// pixel is covered within 3 frames.
+const SCAN_POSITIONS_X: [f32; 3] = [320.0, 640.0, 960.0];
+
+impl RoiTracker {
+    fn new() -> Self {
+        Self {
+            center: None,
+            frames_without_detection: 0,
+            max_coast_frames: 30,
+            scan_index: 0,
+            ema_alpha: 0.3,
+        }
+    }
+
+    /// Return the crop rectangle `[x1, y1, x2, y2]` clamped to frame bounds.
+    fn crop_rect(&self, frame_w: u32, frame_h: u32, crop_size: u32) -> [u32; 4] {
+        let (cx, cy) = match self.center {
+            Some(c) => c,
+            None => {
+                let sx = SCAN_POSITIONS_X[self.scan_index % SCAN_POSITIONS_X.len()];
+                (sx, frame_h as f32 / 2.0)
+            }
+        };
+
+        let half = crop_size as f32 / 2.0;
+        // Clamp so the full crop fits inside the frame when possible.
+        let max_x1 = (frame_w as f32 - crop_size as f32).max(0.0);
+        let max_y1 = (frame_h as f32 - crop_size as f32).max(0.0);
+        let x1 = (cx - half).max(0.0).min(max_x1) as u32;
+        let y1 = (cy - half).max(0.0).min(max_y1) as u32;
+        let x2 = (x1 + crop_size).min(frame_w);
+        let y2 = (y1 + crop_size).min(frame_h);
+
+        [x1, y1, x2, y2]
+    }
+
+    /// Feed back this frame's detections (already in full-image coordinates).
+    fn update(&mut self, detections: &[FaceDetection]) {
+        if detections.is_empty() {
+            self.frames_without_detection += 1;
+            if self.frames_without_detection >= self.max_coast_frames || self.center.is_none() {
+                // Switch to / stay in scanning mode.
+                self.center = None;
+                self.scan_index += 1;
+            }
+            return;
+        }
+
+        self.frames_without_detection = 0;
+
+        // Track the highest-confidence detection.
+        let best = detections
+            .iter()
+            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
+            .unwrap();
+        let new_cx = (best.bbox[0] + best.bbox[2]) / 2.0;
+        let new_cy = (best.bbox[1] + best.bbox[3]) / 2.0;
+
+        match self.center {
+            Some((old_cx, old_cy)) => {
+                let dist = ((new_cx - old_cx).powi(2) + (new_cy - old_cy).powi(2)).sqrt();
+                if dist > 100.0 {
+                    self.center = Some((new_cx, new_cy));
+                } else {
+                    let a = self.ema_alpha;
+                    self.center = Some((
+                        old_cx + a * (new_cx - old_cx),
+                        old_cy + a * (new_cy - old_cy),
+                    ));
+                }
+            }
+            None => {
+                self.center = Some((new_cx, new_cy));
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -815,7 +914,7 @@ fn processing_thread(
     let mut face_detector = FaceDetector::new(SCRFD_MODEL_PATH)?;
     tracing::info!("SCRFD face detector ready");
 
-    tracing::info!("Initializing camera (with RGB→IR alignment)...");
+    tracing::info!("Initializing camera...");
     let mut camera = Camera::new()?;
     tracing::info!("Camera initialized");
 
@@ -829,6 +928,8 @@ fn processing_thread(
     let encode_handle = std::thread::spawn(move || {
         encode_thread(frame_rx, tx, &encode_running_clone);
     });
+
+    let mut roi_tracker = RoiTracker::new();
 
     while running.load(Ordering::Relaxed) {
         let t_loop = std::time::Instant::now();
@@ -846,12 +947,21 @@ fn processing_thread(
 
         let cfg = *config.read().unwrap();
 
+        let roi_rect = roi_tracker.crop_rect(frames.rgb.width(), frames.rgb.height(), 640);
+
         let (rgb_faces_raw, ir_faces_raw, timing) = run_detection(
             &mut head_detector,
             &mut face_detector,
             &frames,
             cfg,
+            roi_rect,
         );
+
+        // Update ROI tracker with the active stream's detections.
+        match cfg.stream {
+            StreamSelection::Rgb => roi_tracker.update(&rgb_faces_raw),
+            StreamSelection::Ir => roi_tracker.update(&ir_faces_raw),
+        }
 
         // Attach XYZ coordinates to every detection
         let rgb_faces: Vec<_> = rgb_faces_raw
@@ -903,6 +1013,7 @@ fn processing_thread(
             rgb_faces,
             ir_faces,
             active_config: cfg,
+            roi_rect,
         };
 
         if frame_tx.send(data).is_err() {
@@ -973,21 +1084,29 @@ fn run_detection(
     face: &mut FaceDetector,
     frames: &camera::CameraFrames,
     cfg: DetectionConfig,
+    roi_rect: [u32; 4],
 ) -> (Vec<FaceDetection>, Vec<FaceDetection>, Option<DetectionTiming>) {
     let run_rgb = matches!(cfg.stream, StreamSelection::Rgb);
     let run_ir = matches!(cfg.stream, StreamSelection::Ir);
 
-    let (rgb_faces, rgb_t) = if run_rgb {
-        detect_stream_rgb(head, face, &frames.rgb, cfg.algo)
-    } else {
-        (Vec::new(), None)
-    };
+    let offset_x = roi_rect[0] as f32;
+    let offset_y = roi_rect[1] as f32;
 
-    let (ir_faces, ir_t) = if run_ir {
-        detect_stream_ir(head, face, &frames.ir, cfg.algo)
+    let (mut rgb_faces, rgb_t) = if run_rgb {
+        let crop = roi_crop_rgb(&frames.rgb, &roi_rect);
+        detect_stream_rgb(head, face, &crop, cfg.algo)
     } else {
         (Vec::new(), None)
     };
+    translate_detections(&mut rgb_faces, offset_x, offset_y);
+
+    let (mut ir_faces, ir_t) = if run_ir {
+        let crop = roi_crop_gray(&frames.ir, &roi_rect);
+        detect_stream_ir(head, face, &crop, cfg.algo)
+    } else {
+        (Vec::new(), None)
+    };
+    translate_detections(&mut ir_faces, offset_x, offset_y);
 
     // Build combined timing if both streams ran
     let timing = match (rgb_t, ir_t) {
@@ -1212,6 +1331,34 @@ fn crop_gray(image: &image::GrayImage, bbox: &[f32; 4]) -> image::GrayImage {
     image::imageops::crop_imm(image, x1, y1, w, h).to_image()
 }
 
+/// Crop an RGB image to a ROI rectangle [x1, y1, x2, y2] (u32 pixel coords).
+fn roi_crop_rgb(image: &RgbImage, rect: &[u32; 4]) -> RgbImage {
+    let [x1, y1, x2, y2] = *rect;
+    image::imageops::crop_imm(image, x1, y1, x2 - x1, y2 - y1).to_image()
+}
+
+/// Crop a grayscale image to a ROI rectangle [x1, y1, x2, y2] (u32 pixel coords).
+fn roi_crop_gray(image: &image::GrayImage, rect: &[u32; 4]) -> image::GrayImage {
+    let [x1, y1, x2, y2] = *rect;
+    image::imageops::crop_imm(image, x1, y1, x2 - x1, y2 - y1).to_image()
+}
+
+/// Shift detection bboxes and landmarks from crop-local to full-image coordinates.
+fn translate_detections(detections: &mut [FaceDetection], offset_x: f32, offset_y: f32) {
+    for det in detections.iter_mut() {
+        det.bbox[0] += offset_x;
+        det.bbox[1] += offset_y;
+        det.bbox[2] += offset_x;
+        det.bbox[3] += offset_y;
+        if let Some(ref mut lms) = det.landmarks {
+            for lm in lms.iter_mut() {
+                lm.x += offset_x;
+                lm.y += offset_y;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encode thread
 // ---------------------------------------------------------------------------
@@ -1270,6 +1417,7 @@ fn encode_frame(compressor: &mut turbojpeg::Compressor, data: &FrameData) -> Vec
         rgb_size: [data.rgb.width(), data.rgb.height()],
         ir_size: [data.ir.width(), data.ir.height()],
         active_config: data.active_config,
+        roi_rect: Some(data.roi_rect),
     };
 
     encode_frame_message(&rgb_jpeg, &ir_jpeg, &metadata)

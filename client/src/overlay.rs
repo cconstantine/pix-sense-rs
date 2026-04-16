@@ -2,6 +2,7 @@ use egui::{Color32, Painter, Pos2, Stroke, StrokeKind};
 use pix_sense_common::FaceDetection;
 
 const BBOX_COLOR: Color32 = Color32::from_rgb(0, 255, 255);
+const ROI_COLOR: Color32 = Color32::from_rgb(255, 255, 255);
 const EYE_COLOR: Color32 = Color32::from_rgb(0, 255, 0);
 const LANDMARK_COLOR: Color32 = Color32::from_rgb(255, 255, 0);
 const XYZ_COLOR: Color32 = Color32::from_rgb(255, 180, 0);
@@ -77,4 +78,31 @@ pub fn draw_faces(
             }
         }
     }
+}
+
+/// Draw the ROI crop boundary as a dashed-style rectangle.
+pub fn draw_roi(
+    painter: &Painter,
+    roi_rect: Option<[u32; 4]>,
+    offset: Pos2,
+    scale_x: f32,
+    scale_y: f32,
+) {
+    let Some([x1, y1, x2, y2]) = roi_rect else { return };
+    let rect = egui::Rect::from_min_max(
+        Pos2::new(
+            offset.x + x1 as f32 * scale_x,
+            offset.y + y1 as f32 * scale_y,
+        ),
+        Pos2::new(
+            offset.x + x2 as f32 * scale_x,
+            offset.y + y2 as f32 * scale_y,
+        ),
+    );
+    painter.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.0, ROI_COLOR.gamma_multiply(0.5)),
+        StrokeKind::Outside,
+    );
 }

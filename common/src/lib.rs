@@ -65,6 +65,9 @@ pub struct FrameMetadata {
     pub ir_size: [u32; 2],
     /// The algorithm + stream configuration that was active when this frame was processed.
     pub active_config: DetectionConfig,
+    /// ROI crop rectangle [x1, y1, x2, y2] in full-image pixel coordinates.
+    #[serde(default)]
+    pub roi_rect: Option<[u32; 4]>,
 }
 
 /// Binary message format:

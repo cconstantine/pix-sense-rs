@@ -83,6 +83,7 @@ struct App {
     latest_ir_faces: Vec<FaceDetection>,
     rgb_size: [u32; 2],
     ir_size: [u32; 2],
+    roi_rect: Option<[u32; 4]>,
     fps_counter: FpsCounter,
     connected: bool,
     /// Config the user has selected in the UI (sent to server on change).
@@ -269,6 +270,7 @@ impl App {
             latest_ir_faces: Vec::new(),
             rgb_size: [640, 480],
             ir_size: [640, 480],
+            roi_rect: None,
             fps_counter: FpsCounter::new(),
             connected: false,
             local_config: DetectionConfig::default(),
@@ -314,6 +316,7 @@ impl App {
         self.rgb_size = metadata.rgb_size;
         self.ir_size = metadata.ir_size;
         self.active_config = metadata.active_config;
+        self.roi_rect = metadata.roi_rect;
 
         // Decode RGB JPEG
         if let Some(color_image) = decode_jpeg_rgb(rgb_jpeg) {
@@ -623,6 +626,13 @@ impl eframe::App for App {
                                         scale_x,
                                         scale_y,
                                     );
+                                    overlay::draw_roi(
+                                        ui.painter(),
+                                        self.roi_rect,
+                                        rect.left_top(),
+                                        scale_x,
+                                        scale_y,
+                                    );
                                 } else {
                                     ui.label("Waiting for camera...");
                                 }
@@ -659,6 +669,13 @@ impl eframe::App for App {
                                     overlay::draw_faces(
                                         ui.painter(),
                                         &self.latest_ir_faces,
+                                        rect.left_top(),
+                                        scale_x,
+                                        scale_y,
+                                    );
+                                    overlay::draw_roi(
+                                        ui.painter(),
+                                        self.roi_rect,
                                         rect.left_top(),
                                         scale_x,
                                         scale_y,
