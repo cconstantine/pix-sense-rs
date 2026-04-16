@@ -68,6 +68,12 @@ pub struct FrameMetadata {
     /// ROI crop rectangle [x1, y1, x2, y2] in full-image pixel coordinates.
     #[serde(default)]
     pub roi_rect: Option<[u32; 4]>,
+    /// Index into `rgb_faces` of the person currently being tracked (if any).
+    #[serde(default)]
+    pub tracked_rgb_idx: Option<usize>,
+    /// Index into `ir_faces` of the person currently being tracked (if any).
+    #[serde(default)]
+    pub tracked_ir_idx: Option<usize>,
 }
 
 /// Binary message format:

@@ -77,7 +77,8 @@ pub async fn write_detections(pool: &PgPool, detections: &[[f32; 3]]) {
             let name = "pixo-16".to_string();
             if let Err(e) = sqlx::query(
                 "INSERT INTO tracking_locations (name, x, y, z, updated_at)
-                 VALUES ($1, $2, $3, $4, $5)",
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (name) DO UPDATE SET x = $2, y = $3, z = $4, updated_at = $5",
             )
             .bind(&name)
             .bind(x)

@@ -6,7 +6,11 @@ use realsense_rust::{
     frame::{ColorFrame, DepthFrame, InfraredFrame},
     kind::{Rs2CameraInfo, Rs2Format, Rs2Option, Rs2StreamKind},
     pipeline::InactivePipeline,
-    processing_blocks::align::Align,
+    processing_blocks::{
+        align::Align,
+        hole_filling::HoleFillingFilter,
+        temporal_filter::TemporalFilter,
+    },
 };
 use std::collections::HashSet;
 
@@ -32,6 +36,8 @@ pub struct Camera {
     pipeline: realsense_rust::pipeline::ActivePipeline,
     align: Align,
     intrinsics: CameraIntrinsics,
+    temporal_filter: TemporalFilter,
+    hole_filling: HoleFillingFilter,
 }
 
 pub struct CameraFrames {
@@ -97,10 +103,10 @@ impl Camera {
             .start(Some(config))
             .context("Failed to start pipeline")?;
 
-        // Disable the IR dot projector so it doesn't interfere with the IR image
+        // Enable the IR emitter (dot projector) for improved depth quality
         for mut sensor in pipeline.profile().device().sensors() {
-            if sensor.set_option(Rs2Option::EmitterEnabled, 0.0).is_ok() {
-                tracing::info!("Disabled IR emitter (dot projector)");
+            if sensor.set_option(Rs2Option::EmitterEnabled, 1.0).is_ok() {
+                tracing::info!("Enabled IR emitter (dot projector)");
             }
         }
 
@@ -126,7 +132,13 @@ impl Camera {
         let align = Align::new(Rs2StreamKind::Color, 10)
             .context("Failed to create alignment processing block")?;
 
-        Ok(Camera { pipeline, align, intrinsics })
+        let temporal_filter = TemporalFilter::new(10)
+            .context("Failed to create temporal filter")?;
+        let hole_filling = HoleFillingFilter::new(10)
+            .context("Failed to create hole-filling filter")?;
+        tracing::info!("Depth post-processing filters enabled (temporal + hole-filling)");
+
+        Ok(Camera { pipeline, align, intrinsics, temporal_filter, hole_filling })
     }
 
     /// Try to capture a frame. Returns None on timeout (caller should retry).
@@ -193,12 +205,27 @@ impl Camera {
         }
 
         // Extract depth frames (Z16: 16-bit unsigned, millimeters)
-        // Keep raw u16 values for 3-D deprojection.
+        // Apply temporal filter (smooths across frames) then hole-filling before
+        // reading raw u16 values for 3-D deprojection.
         let mut depth_raw_buf: Vec<u16> = Vec::new();
         let mut depth_w = 1280u32;
         let mut depth_h = 720u32;
-        let depth_frames = frames.frames_of_type::<DepthFrame>();
-        if let Some(depth) = depth_frames.first() {
+        let filter_timeout = std::time::Duration::from_millis(100);
+
+        // Pipe: raw depth → temporal filter → hole-filling → extract u16 data.
+        // Each filter's queue() consumes the frame, so we need ownership via into_iter().
+        let filtered_depth = frames
+            .frames_of_type::<DepthFrame>()
+            .into_iter()
+            .next()
+            .and_then(|depth| {
+                self.temporal_filter.queue(depth).ok()?;
+                let depth = self.temporal_filter.wait(filter_timeout).ok()?;
+                self.hole_filling.queue(depth).ok()?;
+                self.hole_filling.wait(filter_timeout).ok()
+            });
+
+        if let Some(depth) = filtered_depth.as_ref() {
             let w = depth.width() as u32;
             let h = depth.height() as u32;
             depth_w = w;

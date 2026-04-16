@@ -84,6 +84,8 @@ struct App {
     rgb_size: [u32; 2],
     ir_size: [u32; 2],
     roi_rect: Option<[u32; 4]>,
+    tracked_rgb_idx: Option<usize>,
+    tracked_ir_idx: Option<usize>,
     fps_counter: FpsCounter,
     connected: bool,
     /// Config the user has selected in the UI (sent to server on change).
@@ -271,6 +273,8 @@ impl App {
             rgb_size: [640, 480],
             ir_size: [640, 480],
             roi_rect: None,
+            tracked_rgb_idx: None,
+            tracked_ir_idx: None,
             fps_counter: FpsCounter::new(),
             connected: false,
             local_config: DetectionConfig::default(),
@@ -317,6 +321,8 @@ impl App {
         self.ir_size = metadata.ir_size;
         self.active_config = metadata.active_config;
         self.roi_rect = metadata.roi_rect;
+        self.tracked_rgb_idx = metadata.tracked_rgb_idx;
+        self.tracked_ir_idx = metadata.tracked_ir_idx;
 
         // Decode RGB JPEG
         if let Some(color_image) = decode_jpeg_rgb(rgb_jpeg) {
@@ -625,6 +631,7 @@ impl eframe::App for App {
                                         rect.left_top(),
                                         scale_x,
                                         scale_y,
+                                        self.tracked_rgb_idx,
                                     );
                                     overlay::draw_roi(
                                         ui.painter(),
@@ -672,6 +679,7 @@ impl eframe::App for App {
                                         rect.left_top(),
                                         scale_x,
                                         scale_y,
+                                        self.tracked_ir_idx,
                                     );
                                     overlay::draw_roi(
                                         ui.painter(),

@@ -2,6 +2,8 @@ use egui::{Color32, Painter, Pos2, Stroke, StrokeKind};
 use pix_sense_common::FaceDetection;
 
 const BBOX_COLOR: Color32 = Color32::from_rgb(0, 255, 255);
+const TRACKED_COLOR: Color32 = Color32::from_rgb(0, 255, 100);
+const UNTRACKED_COLOR: Color32 = Color32::from_rgb(120, 120, 120);
 const ROI_COLOR: Color32 = Color32::from_rgb(255, 255, 255);
 const EYE_COLOR: Color32 = Color32::from_rgb(0, 255, 0);
 const LANDMARK_COLOR: Color32 = Color32::from_rgb(255, 255, 0);
@@ -10,14 +12,31 @@ const EYE_RADIUS: f32 = 6.0;
 const LANDMARK_RADIUS: f32 = 3.0;
 
 /// Draw face detections with optional landmarks and XYZ coordinates on the egui painter.
+/// When `tracked_idx` is `Some`, the face at that index is highlighted as the actively
+/// tracked person and others are dimmed.
 pub fn draw_faces(
     painter: &Painter,
     faces: &[FaceDetection],
     offset: Pos2,
     scale_x: f32,
     scale_y: f32,
+    tracked_idx: Option<usize>,
 ) {
-    for face in faces {
+    let has_tracked = tracked_idx.is_some();
+
+    for (i, face) in faces.iter().enumerate() {
+        let is_tracked = tracked_idx == Some(i);
+
+        // Choose color based on tracking state
+        let box_color = if is_tracked {
+            TRACKED_COLOR
+        } else if has_tracked {
+            UNTRACKED_COLOR
+        } else {
+            BBOX_COLOR
+        };
+        let box_width = if is_tracked { 2.5 } else { 1.5 };
+
         // Draw bounding box
         let rect = egui::Rect::from_min_max(
             Pos2::new(
@@ -32,9 +51,20 @@ pub fn draw_faces(
         painter.rect_stroke(
             rect,
             0.0,
-            Stroke::new(1.5, BBOX_COLOR),
+            Stroke::new(box_width, box_color),
             StrokeKind::Outside,
         );
+
+        // Tracking label for the actively tracked person
+        if is_tracked {
+            painter.text(
+                rect.left_top() + egui::vec2(2.0, -28.0),
+                egui::Align2::LEFT_TOP,
+                "TRACKING",
+                egui::FontId::proportional(12.0),
+                TRACKED_COLOR,
+            );
+        }
 
         // Confidence label above the box
         let label = format!("{:.0}%", face.confidence * 100.0);
@@ -43,7 +73,7 @@ pub fn draw_faces(
             egui::Align2::LEFT_TOP,
             label,
             egui::FontId::proportional(12.0),
-            BBOX_COLOR,
+            box_color,
         );
 
         // XYZ coordinates below the confidence label (inside the box top)
@@ -54,26 +84,27 @@ pub fn draw_faces(
                 egui::Align2::LEFT_TOP,
                 xyz_label,
                 egui::FontId::monospace(10.0),
-                XYZ_COLOR,
+                if is_tracked { TRACKED_COLOR } else { XYZ_COLOR },
             );
         }
 
         // Draw landmarks (if available — head-only detections may not have them)
         if let Some(ref landmarks) = face.landmarks {
-            for (i, lm) in landmarks.iter().enumerate() {
+            for (li, lm) in landmarks.iter().enumerate() {
                 let center = Pos2::new(
                     offset.x + lm.x * scale_x,
                     offset.y + lm.y * scale_y,
                 );
 
                 // Eyes get larger, green circles; other landmarks are smaller, yellow
-                let (radius, color) = if i <= 1 {
+                let (radius, color) = if li <= 1 {
                     (EYE_RADIUS, EYE_COLOR)
                 } else {
                     (LANDMARK_RADIUS, LANDMARK_COLOR)
                 };
 
-                painter.circle_filled(center, radius, color);
+                let alpha = if has_tracked && !is_tracked { 0.4 } else { 1.0 };
+                painter.circle_filled(center, radius, color.gamma_multiply(alpha));
                 painter.circle_stroke(center, radius, Stroke::new(1.0, Color32::BLACK));
             }
         }

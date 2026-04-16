@@ -1,6 +1,7 @@
 mod camera;
 mod db;
 mod face;
+mod person_selector;
 mod renderer;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,6 +99,8 @@ struct FrameData {
     ir_faces: Vec<FaceDetection>,
     active_config: DetectionConfig,
     roi_rect: [u32; 4],
+    tracked_rgb_idx: Option<usize>,
+    tracked_ir_idx: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +933,7 @@ fn processing_thread(
     });
 
     let mut roi_tracker = RoiTracker::new();
+    let mut person_selector = person_selector::PersonSelector::new();
 
     while running.load(Ordering::Relaxed) {
         let t_loop = std::time::Instant::now();
@@ -992,20 +996,37 @@ fn processing_thread(
             })
             .collect();
 
-        // Send XYZ coordinates to the DB writer task (non-blocking).
-        // Apply camera extrinsics to convert from camera frame to world frame.
-        let xyzs: Vec<[f32; 3]> = {
+        // Build indexed world-frame positions with source tracking so we can
+        // identify which face in which stream the PersonSelector picks.
+        let face_refs: Vec<(bool, usize, [f32; 3])> = {
             let ext = extrinsics.read().unwrap();
-            rgb_faces
-                .iter()
-                .chain(ir_faces.iter())
-                .filter_map(|f| f.xyz)
-                .map(|p| ext.as_ref().map_or(p, |e| e.apply(p)))
-                .collect()
+            let mut refs = Vec::new();
+            for (i, f) in rgb_faces.iter().enumerate() {
+                if let Some(p) = f.xyz {
+                    refs.push((true, i, ext.as_ref().map_or(p, |e| e.apply(p))));
+                }
+            }
+            for (i, f) in ir_faces.iter().enumerate() {
+                if let Some(p) = f.xyz {
+                    refs.push((false, i, ext.as_ref().map_or(p, |e| e.apply(p))));
+                }
+            }
+            refs
         };
-        if !xyzs.is_empty() {
-            let _ = db_tx.send(xyzs);
-        }
+        let world_xyzs: Vec<[f32; 3]> = face_refs.iter().map(|&(_, _, xyz)| xyz).collect();
+
+        let (tracked_rgb_idx, tracked_ir_idx) =
+            if let Some((sel_idx, selected)) = person_selector.select(&world_xyzs) {
+                let _ = db_tx.send(vec![selected]);
+                let (is_rgb, face_idx, _) = face_refs[sel_idx];
+                if is_rgb {
+                    (Some(face_idx), None)
+                } else {
+                    (None, Some(face_idx))
+                }
+            } else {
+                (None, None)
+            };
 
         let data = FrameData {
             rgb: frames.rgb,
@@ -1014,6 +1035,8 @@ fn processing_thread(
             ir_faces,
             active_config: cfg,
             roi_rect,
+            tracked_rgb_idx,
+            tracked_ir_idx,
         };
 
         if frame_tx.send(data).is_err() {
@@ -1262,8 +1285,10 @@ fn detect_stream_ir(
 // XYZ deprojection
 // ---------------------------------------------------------------------------
 
-/// Sample a 5×5 window of depth values around the face bounding-box centre,
+/// Sample an adaptive window of depth values around the face bounding-box centre,
 /// take the median of valid readings, and deproject to camera-frame XYZ (metres).
+/// The window scales to ~30% of the face bbox (clamped to 5–21 px per axis) so that
+/// distant (small) faces still get adequate depth coverage.
 fn compute_xyz(
     bbox: &[f32; 4],
     depth_raw: &[u16],
@@ -1278,14 +1303,22 @@ fn compute_xyz(
     let cx_px = (bbox[0] + bbox[2]) / 2.0;
     let cy_px = (bbox[1] + bbox[3]) / 2.0;
 
-    let mut samples: Vec<u16> = Vec::with_capacity(25);
-    for dy in -2i32..=2 {
-        for dx in -2i32..=2 {
+    // Adaptive sampling: ~30 % of bbox, clamped to [5, 21] px per axis
+    let face_w = (bbox[2] - bbox[0]).max(1.0);
+    let face_h = (bbox[3] - bbox[1]).max(1.0);
+    let sample_w = ((face_w * 0.3) as i32).clamp(5, 21);
+    let sample_h = ((face_h * 0.3) as i32).clamp(5, 21);
+    let half_w = sample_w / 2;
+    let half_h = sample_h / 2;
+
+    let mut samples: Vec<u16> = Vec::with_capacity((sample_w * sample_h) as usize);
+    for dy in -half_h..=half_h {
+        for dx in -half_w..=half_w {
             let x = (cx_px as i32 + dx).clamp(0, depth_w as i32 - 1) as u32;
             let y = (cy_px as i32 + dy).clamp(0, depth_h as i32 - 1) as u32;
             let d = depth_raw[(y * depth_w + x) as usize];
-            // Valid range: 300–5000 mm (matches depth_to_gray)
-            if d >= 300 && d <= 5000 {
+            // Valid range: 300–9000 mm (D455 rated to ~6 m usable, ~14 m max)
+            if d >= 300 && d <= 9000 {
                 samples.push(d);
             }
         }
@@ -1418,6 +1451,8 @@ fn encode_frame(compressor: &mut turbojpeg::Compressor, data: &FrameData) -> Vec
         ir_size: [data.ir.width(), data.ir.height()],
         active_config: data.active_config,
         roi_rect: Some(data.roi_rect),
+        tracked_rgb_idx: data.tracked_rgb_idx,
+        tracked_ir_idx: data.tracked_ir_idx,
     };
 
     encode_frame_message(&rgb_jpeg, &ir_jpeg, &metadata)
