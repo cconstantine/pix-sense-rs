@@ -3,8 +3,9 @@ mod overlay;
 use eframe::egui;
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 use pix_sense_common::{
-    decode_frame_message, CalibrationPoint, CameraExtrinsics, DetectionAlgo, DetectionConfig,
-    FaceDetection, LedPoint, Pattern, PatternUpdate, ServerMessage, StreamSelection, TrackingPoint,
+    decode_frame_message, CalibrationPoint, CameraExtrinsics, ClientMessage, DetectionAlgo,
+    DetectionConfig, FaceDetection, LedPoint, Pattern, PatternUpdate, ServerMessage,
+    StreamSelection, TrackingPoint,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -357,7 +358,16 @@ impl App {
 
     /// Send the current local_config to the server as a JSON text message.
     fn send_config(&mut self) {
-        if let Ok(json) = serde_json::to_string(&self.local_config) {
+        let msg = ClientMessage::Config(self.local_config);
+        if let Ok(json) = serde_json::to_string(&msg) {
+            self.ws_sender.send(WsMessage::Text(json));
+        }
+    }
+
+    /// Tell the server to lock tracking onto the given camera-frame XYZ.
+    fn send_select_person(&mut self, xyz: [f32; 3]) {
+        let msg = ClientMessage::SelectPerson { xyz };
+        if let Ok(json) = serde_json::to_string(&msg) {
             self.ws_sender.send(WsMessage::Text(json));
         }
     }
@@ -585,6 +595,11 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |_ui| {});
 
         // ── Cameras window ────────────────────────────────────────
+        // Clicks on face boxes flow out of the closure via these locals, so we can
+        // call `self.send_select_person` after the `open: &mut self.show_cameras`
+        // borrow is released.
+        let mut rgb_selection: Option<[f32; 3]> = None;
+        let mut ir_selection: Option<[f32; 3]> = None;
         egui::Window::new("Cameras")
             .default_size([640.0, 400.0])
             .default_pos([10.0, 80.0])
@@ -625,13 +640,14 @@ impl eframe::App for App {
 
                                     let scale_x = rect.width() / self.rgb_size[0] as f32;
                                     let scale_y = rect.height() / self.rgb_size[1] as f32;
-                                    overlay::draw_faces(
-                                        ui.painter(),
+                                    let clicked = overlay::draw_faces(
+                                        ui,
                                         &self.latest_rgb_faces,
                                         rect.left_top(),
                                         scale_x,
                                         scale_y,
                                         self.tracked_rgb_idx,
+                                        "rgb_face",
                                     );
                                     overlay::draw_roi(
                                         ui.painter(),
@@ -640,6 +656,15 @@ impl eframe::App for App {
                                         scale_x,
                                         scale_y,
                                     );
+                                    if let Some(i) = clicked {
+                                        if let Some(xyz) = self
+                                            .latest_rgb_faces
+                                            .get(i)
+                                            .and_then(|f| f.xyz)
+                                        {
+                                            rgb_selection = Some(xyz);
+                                        }
+                                    }
                                 } else {
                                     ui.label("Waiting for camera...");
                                 }
@@ -673,13 +698,14 @@ impl eframe::App for App {
 
                                     let scale_x = rect.width() / self.ir_size[0] as f32;
                                     let scale_y = rect.height() / self.ir_size[1] as f32;
-                                    overlay::draw_faces(
-                                        ui.painter(),
+                                    let clicked = overlay::draw_faces(
+                                        ui,
                                         &self.latest_ir_faces,
                                         rect.left_top(),
                                         scale_x,
                                         scale_y,
                                         self.tracked_ir_idx,
+                                        "ir_face",
                                     );
                                     overlay::draw_roi(
                                         ui.painter(),
@@ -688,6 +714,15 @@ impl eframe::App for App {
                                         scale_x,
                                         scale_y,
                                     );
+                                    if let Some(i) = clicked {
+                                        if let Some(xyz) = self
+                                            .latest_ir_faces
+                                            .get(i)
+                                            .and_then(|f| f.xyz)
+                                        {
+                                            ir_selection = Some(xyz);
+                                        }
+                                    }
                                 } else {
                                     ui.label("Waiting for camera...");
                                 }
@@ -695,6 +730,13 @@ impl eframe::App for App {
                         }
                     });
             });
+
+        // If the user clicked a face box, forward the camera-frame XYZ to the server.
+        // IR takes precedence when both fire in the same frame (rare; only one panel
+        // is visible at a time given the current stream selection).
+        if let Some(xyz) = ir_selection.or(rgb_selection) {
+            self.send_select_person(xyz);
+        }
 
         // ── 3D Scene window ───────────────────────────────────────
         egui::Window::new("3D Scene")

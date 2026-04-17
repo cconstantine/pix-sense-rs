@@ -18,6 +18,15 @@ impl PersonSelector {
         }
     }
 
+    /// Lock tracking onto the person at `target` (world frame). The next call to
+    /// `select` will pick the detection closest to this position, and the 30-second
+    /// rotation timer resets — so manual selections persist for one rotation window
+    /// before auto-rotation resumes.
+    pub fn lock_to(&mut self, target: [f32; 3]) {
+        self.current_position = Some(target);
+        self.locked_since = Instant::now();
+    }
+
     /// Given all detected positions this frame, return the index and position of the
     /// single person to track.
     pub fn select(&mut self, detections: &[[f32; 3]]) -> Option<(usize, [f32; 3])> {

@@ -1,5 +1,4 @@
 mod context;
-mod opc;
 mod pipeline;
 mod shaders;
 
@@ -100,18 +99,15 @@ fn run_inner(
         });
     }
 
-    // --- Spawn OPC sender tasks (async, on the local rt) ---
-    let opc_senders: Vec<(tokio::sync::mpsc::Sender<Vec<u8>>, usize)> = {
-        let _guard = rt.enter(); // set runtime context so tokio::spawn works
+    // --- Per-device LED offsets (OPC disabled) ---
+    let device_offsets: Vec<usize> = {
         let mut offset = 0;
-        let mut senders = Vec::new();
-        for (addr, leds) in &leds_by_device {
-            let n = leds.len();
-            let tx = opc::spawn(addr.clone(), running.clone());
-            senders.push((tx, offset));
-            offset += n;
+        let mut offsets = Vec::with_capacity(leds_by_device.len());
+        for (_, leds) in &leds_by_device {
+            offsets.push(offset);
+            offset += leds.len();
         }
-        senders
+        offsets
     };
 
     // --- Create headless EGL context ---
@@ -156,27 +152,22 @@ fn run_inner(
             // Collect all LED RGB values in device order (matches /api/leds order).
             let mut all_rgb: Vec<[u8; 3]> = Vec::with_capacity(pipe.num_leds);
 
-            // For each FadeCandy device, extract its LED slice and send via OPC.
-            for (tx, offset) in &opc_senders {
-                let n_leds = {
-                    let next = opc_senders
-                        .iter()
-                        .find(|(_, o)| *o > *offset)
-                        .map(|(_, o)| *o)
-                        .unwrap_or(pipe.num_leds);
-                    next - offset
-                };
+            // For each FadeCandy device, extract its LED slice for the WebSocket broadcast.
+            for (i, offset) in device_offsets.iter().enumerate() {
+                let next = device_offsets
+                    .get(i + 1)
+                    .copied()
+                    .unwrap_or(pipe.num_leds);
+                let n_leds = next - offset;
                 let rgb = RendererPipeline::extract_led_rgb(
                     &rgba[offset * 4..],
                     n_leds,
                     current_brightness,
                     current_gamma,
                 );
-                // Append to the full color list for WebSocket broadcast.
                 for chunk in rgb.chunks_exact(3) {
                     all_rgb.push([chunk[0], chunk[1], chunk[2]]);
                 }
-                let _ = tx.try_send(rgb); // drop frame on backpressure
             }
 
             // Broadcast LED colors to WebSocket clients via the watch channel.

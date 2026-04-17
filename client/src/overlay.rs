@@ -1,4 +1,4 @@
-use egui::{Color32, Painter, Pos2, Stroke, StrokeKind};
+use egui::{Color32, Painter, Pos2, Sense, Stroke, StrokeKind};
 use pix_sense_common::FaceDetection;
 
 const BBOX_COLOR: Color32 = Color32::from_rgb(0, 255, 255);
@@ -11,18 +11,25 @@ const XYZ_COLOR: Color32 = Color32::from_rgb(255, 180, 0);
 const EYE_RADIUS: f32 = 6.0;
 const LANDMARK_RADIUS: f32 = 3.0;
 
-/// Draw face detections with optional landmarks and XYZ coordinates on the egui painter.
+/// Draw face detections with optional landmarks and XYZ coordinates.
 /// When `tracked_idx` is `Some`, the face at that index is highlighted as the actively
-/// tracked person and others are dimmed.
+/// tracked person and others are dimmed. Each face box is clickable — if the user
+/// clicked one this frame, its index is returned.
+///
+/// `id_salt` scopes the per-face interaction IDs so callers can draw faces in
+/// multiple panels (e.g. RGB and IR) without ID collisions.
 pub fn draw_faces(
-    painter: &Painter,
+    ui: &mut egui::Ui,
     faces: &[FaceDetection],
     offset: Pos2,
     scale_x: f32,
     scale_y: f32,
     tracked_idx: Option<usize>,
-) {
+    id_salt: &str,
+) -> Option<usize> {
     let has_tracked = tracked_idx.is_some();
+    let mut clicked: Option<usize> = None;
+    let painter = ui.painter().clone();
 
     for (i, face) in faces.iter().enumerate() {
         let is_tracked = tracked_idx == Some(i);
@@ -48,6 +55,17 @@ pub fn draw_faces(
                 offset.y + face.bbox[3] * scale_y,
             ),
         );
+
+        // Clickable hit region — painted above the image, below the overlay lines.
+        let response = ui.interact(
+            rect,
+            egui::Id::new((id_salt, i)),
+            Sense::click(),
+        );
+        if response.clicked() {
+            clicked = Some(i);
+        }
+
         painter.rect_stroke(
             rect,
             0.0,
@@ -109,6 +127,8 @@ pub fn draw_faces(
             }
         }
     }
+
+    clicked
 }
 
 /// Draw the ROI crop boundary as a dashed-style rectangle.

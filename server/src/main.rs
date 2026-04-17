@@ -20,8 +20,8 @@ use axum::{
 };
 use image::RgbImage;
 use pix_sense_common::{
-    encode_frame_message, CalibrationPoint, CameraExtrinsics, DetectionConfig, FaceDetection,
-    FrameMetadata, LedPoint, Pattern, PatternUpdate, ServerMessage, TrackingPoint,
+    encode_frame_message, CalibrationPoint, CameraExtrinsics, ClientMessage, DetectionConfig,
+    FaceDetection, FrameMetadata, LedPoint, Pattern, PatternUpdate, ServerMessage, TrackingPoint,
 };
 use sqlx::{PgPool, Row as _};
 use tokio::sync::{broadcast, watch};
@@ -214,6 +214,9 @@ struct AppState {
     led_colors_rx: watch::Receiver<Option<String>>,
     /// Current camera extrinsics (applied to all depth detections). None = identity (camera at origin).
     extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
+    /// Pending manual person-selection target (world frame). Drained by the processing
+    /// thread once per frame to override `PersonSelector`'s automatic pick.
+    pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
     /// Calibration point pairs collected in this session (in-memory, not persisted).
     calib_points: Arc<Mutex<Vec<CalibrationPoint>>>,
     /// RealSense serial number — used as the DB key for extrinsics.
@@ -296,17 +299,28 @@ async fn main() -> Result<()> {
 
     let calib_points: Arc<Mutex<Vec<CalibrationPoint>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let pending_selection: Arc<Mutex<Option<[f32; 3]>>> = Arc::new(Mutex::new(None));
+
     let metrics = Arc::new(Metrics::new());
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     let config_clone = config.clone();
     let extrinsics_clone = extrinsics.clone();
+    let pending_selection_clone = pending_selection.clone();
     let metrics_clone = metrics.clone();
 
     // Spawn camera + face detection thread (blocking, runs on a std::thread)
     let handle = std::thread::spawn(move || {
-        if let Err(e) = processing_thread(frame_tx, &running_clone, config_clone, db_tx, extrinsics_clone, metrics_clone) {
+        if let Err(e) = processing_thread(
+            frame_tx,
+            &running_clone,
+            config_clone,
+            db_tx,
+            extrinsics_clone,
+            pending_selection_clone,
+            metrics_clone,
+        ) {
             tracing::error!("Processing thread error: {:#}", e);
         }
     });
@@ -364,6 +378,7 @@ async fn main() -> Result<()> {
         tracking_pos_tx,
         led_colors_rx,
         extrinsics,
+        pending_selection,
         calib_points,
         camera_id,
         sculpture_name,
@@ -429,6 +444,8 @@ async fn ws_handler(
             tracking_rx,
             state.led_colors_rx,
             state.db_pool,
+            state.extrinsics,
+            state.pending_selection,
         )
     })
 }
@@ -440,6 +457,8 @@ async fn handle_ws(
     mut tracking_rx: broadcast::Receiver<String>,
     mut led_colors_rx: watch::Receiver<Option<String>>,
     db_pool: Option<PgPool>,
+    extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
+    pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
 ) {
     // Send the current detection config immediately so the client UI reflects
     // the persisted setting rather than its hard-coded default.
@@ -492,20 +511,37 @@ async fn handle_ws(
                     }
                 }
             }
-            // Message from client — handle config updates
+            // Message from client — handle config updates and manual selections
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(cfg) = serde_json::from_str::<DetectionConfig>(&text) {
-                            *config.write().unwrap() = cfg;
-                            tracing::info!(
-                                "Config updated: algo={:?} stream={:?}",
-                                cfg.algo, cfg.stream
-                            );
-                            if let Some(pool) = db_pool.clone() {
-                                tokio::spawn(async move {
-                                    db::save_detection_config(&pool, cfg).await;
-                                });
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(ClientMessage::Config(cfg)) => {
+                                *config.write().unwrap() = cfg;
+                                tracing::info!(
+                                    "Config updated: algo={:?} stream={:?}",
+                                    cfg.algo, cfg.stream
+                                );
+                                if let Some(pool) = db_pool.clone() {
+                                    tokio::spawn(async move {
+                                        db::save_detection_config(&pool, cfg).await;
+                                    });
+                                }
+                            }
+                            Ok(ClientMessage::SelectPerson { xyz }) => {
+                                let world = extrinsics
+                                    .read()
+                                    .unwrap()
+                                    .as_ref()
+                                    .map_or(xyz, |e| e.apply(xyz));
+                                *pending_selection.lock().unwrap() = Some(world);
+                                tracing::info!(
+                                    "Manual person selection: cam={:?} world={:?}",
+                                    xyz, world
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("Unrecognised client message: {e}");
                             }
                         }
                     }
@@ -905,6 +941,7 @@ fn processing_thread(
     config: Arc<RwLock<DetectionConfig>>,
     db_tx: tokio::sync::mpsc::UnboundedSender<Vec<[f32; 3]>>,
     extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
+    pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
     metrics: Arc<Metrics>,
 ) -> Result<()> {
     // Load models first — CUDA graph compilation can take a while,
@@ -1014,6 +1051,11 @@ fn processing_thread(
             refs
         };
         let world_xyzs: Vec<[f32; 3]> = face_refs.iter().map(|&(_, _, xyz)| xyz).collect();
+
+        // Apply any pending manual selection from the UI before the selector runs.
+        if let Some(target) = pending_selection.lock().unwrap().take() {
+            person_selector.lock_to(target);
+        }
 
         let (tracked_rgb_idx, tracked_ir_idx) =
             if let Some((sel_idx, selected)) = person_selector.select(&world_xyzs) {

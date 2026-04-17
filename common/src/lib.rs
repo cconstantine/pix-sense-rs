@@ -112,6 +112,19 @@ pub enum ServerMessage {
     Config(DetectionConfig),
 }
 
+/// Tagged text message sent from WebSocket clients to the server.
+/// Serialises as `{"type":"config","data":{...}}` or
+/// `{"type":"select_person","data":{"xyz":[x,y,z]}}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ClientMessage {
+    /// Update the active detection algorithm / stream.
+    Config(DetectionConfig),
+    /// Lock person tracking onto the person at this camera-frame XYZ.
+    /// The server applies extrinsics to get the world-frame target.
+    SelectPerson { xyz: [f32; 3] },
+}
+
 /// Camera extrinsic transform: p_world = R * p_cam + t
 ///
 /// R is a row-major 3×3 rotation matrix. The camera's origin in world coordinates is `t`.
