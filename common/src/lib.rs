@@ -81,7 +81,8 @@ pub struct FrameMetadata {
 ///   [u32 LE: ir_jpeg_len][ir_jpeg bytes]
 ///   [remaining bytes: JSON of FrameMetadata]
 
-/// A single LED physical position in camera-frame metres (X=right, Y=down, Z=forward).
+/// A single LED physical position in world-frame metres — pixo convention
+/// (X=right, Y=up, Z=forward, right-handed OpenGL).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct LedPoint {
     pub x: f32,
@@ -127,6 +128,10 @@ pub enum ClientMessage {
 
 /// Camera extrinsic transform: p_world = R * p_cam + t
 ///
+/// Camera frame is the depth-sensor native OpenCV convention (X=right, Y=down, Z=forward).
+/// World frame is the pixo convention (X=right, Y=up, Z=forward, right-handed OpenGL).
+/// For a camera mounted upright with no roll, R is a 180° rotation about X =
+/// `diag(1, -1, -1)`, which is what bridges the two right-handed frames.
 /// R is a row-major 3×3 rotation matrix. The camera's origin in world coordinates is `t`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CameraExtrinsics {

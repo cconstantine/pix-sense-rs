@@ -284,9 +284,9 @@ impl App {
             tracking: Vec::new(),
             led_colors: Vec::new(),
             led_pending,
-            scene_yaw: 0.3,
-            scene_pitch: -0.4,
-            scene_zoom: 5.0,
+            scene_yaw: 108.0_f32.to_radians(),
+            scene_pitch: 12.0_f32.to_radians(),
+            scene_zoom: 2.4,
             show_cameras: true,
             show_scene: true,
             show_patterns: true,
@@ -806,7 +806,7 @@ impl eframe::App for App {
                             ui.label(format!("{} pair(s) collected", self.calib_points.len()));
 
                             ui.separator();
-                            ui.label("World XYZ (metres):");
+                            ui.label("World XYZ (m, Y+ up, pixo frame):");
                             ui.horizontal(|ui| {
                                 for (hint, val) in ["X", "Y", "Z"]
                                     .iter()
@@ -921,7 +921,7 @@ impl eframe::App for App {
                             ui.separator();
                             ui.label("Manual adjust:");
 
-                            ui.label("Translation (m):");
+                            ui.label("Translation (m, Y+ up):");
                             let mut t_changed = false;
                             ui.horizontal(|ui| {
                                 t_changed |= ui
@@ -1008,13 +1008,11 @@ impl eframe::App for App {
                             let dx = pt.x;
                             let dy = pt.y;
                             let dz = pt.z;
-                            // Point camera from the tracked location toward the origin.
-                            // Camera world pos = (dist·cos(p)·sin(y), dist·sin(p), -dist·cos(p)·cos(y))
-                            // → sin(y) = dx/r_xz, cos(y) = -dz/r_xz  ⇒  yaw = atan2(dx, -dz)
-                            // → sin(p) = dy/dist                       ⇒  pitch = atan2(dy, r_xz)
-                            self.scene_yaw = dx.atan2(-dz);
-                            self.scene_pitch =
-                                dy.atan2((dx * dx + dz * dz).sqrt());
+                            // Orbit eye = Zoom·(cos(yaw)cos(pitch), sin(pitch), sin(yaw)cos(pitch)).
+                            // Inverting for eye = (dx, dy, dz): yaw = atan2(dz, dx), pitch = atan2(dy, r_xz).
+                            let r_xz = (dx * dx + dz * dz).sqrt();
+                            self.scene_yaw = dz.atan2(dx);
+                            self.scene_pitch = dy.atan2(r_xz);
                             self.scene_zoom =
                                 (dx * dx + dy * dy + dz * dz).sqrt().max(0.5);
                             true
@@ -1068,34 +1066,40 @@ impl eframe::App for App {
                         egui::Color32::from_gray(100),
                     );
 
-                    // Perspective projection.
-                    // Camera frame: X=right, Y=down, Z=forward (metres).
-                    // 1. Yaw rotates around Y axis.
-                    // 2. Pitch rotates around X axis.
-                    // 3. Y is flipped so up is up on screen.
+                    // World frame = pixo: X=right, Y=up, Z=forward (right-handed OpenGL).
+                    // Orbit camera: eye = Zoom * (cos(yaw)cos(pitch), sin(pitch), sin(yaw)cos(pitch)),
+                    // looking at origin with WorldUp = (0, 1, 0). Transcribed from pixo's IsoCamera.
                     let cx = rect.center().x;
                     let cy = rect.center().y;
-                    let scale = 500.0_f32; // pixels per metre
+                    let scale = 500.0_f32; // pixels per metre at unit depth
                     let (yaw, pitch, dist) =
                         (self.scene_yaw, self.scene_pitch, self.scene_zoom);
+                    let (cp, sp) = (pitch.cos(), pitch.sin());
+                    let (cyw, sy) = (yaw.cos(), yaw.sin());
+                    let eye = [dist * cyw * cp, dist * sp, dist * sy * cp];
+                    let fwd = [-cyw * cp, -sp, -sy * cp]; // unit vector from eye to origin
+                    // right = normalize(fwd × WorldUp(0,1,0)) = normalize((-fwd.z, 0, fwd.x));
+                    // up = right × fwd.
+                    let rx0 = -fwd[2];
+                    let rz0 = fwd[0];
+                    let rlen = (rx0 * rx0 + rz0 * rz0).sqrt().max(1e-6);
+                    let right = [rx0 / rlen, 0.0_f32, rz0 / rlen];
+                    let up = [
+                        right[1] * fwd[2] - right[2] * fwd[1],
+                        right[2] * fwd[0] - right[0] * fwd[2],
+                        right[0] * fwd[1] - right[1] * fwd[0],
+                    ];
 
                     let project = |px: f32, py: f32, pz: f32| -> Option<egui::Pos2> {
-                        // Yaw (around Y)
-                        let (sy, cy_) = (yaw.sin(), yaw.cos());
-                        let rx = px * cy_ + pz * sy;
-                        let ry = -py; // flip camera Y-down → display Y-up
-                        let rz = -px * sy + pz * cy_;
-                        // Pitch (around X)
-                        let (sp, cp) = (pitch.sin(), pitch.cos());
-                        let fx = rx;
-                        let fy = ry * cp - rz * sp;
-                        let fz = ry * sp + rz * cp;
-                        // Perspective divide
-                        let w = fz + dist;
-                        if w < 0.01 {
+                        let d = [px - eye[0], py - eye[1], pz - eye[2]];
+                        let vx = d[0] * right[0] + d[1] * right[1] + d[2] * right[2];
+                        let vy = d[0] * up[0] + d[1] * up[1] + d[2] * up[2];
+                        let vz = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+                        if vz < 0.01 {
                             return None;
                         }
-                        Some(egui::pos2(cx + scale * fx / w, cy - scale * fy / w))
+                        // Screen y grows downward; world +Y (up) → negative screen-y offset.
+                        Some(egui::pos2(cx + scale * vx / vz, cy - scale * vy / vz))
                     };
 
                     // LEDs — colored when renderer is active, dim gray otherwise
@@ -1154,60 +1158,29 @@ impl eframe::App for App {
                     }
 
                     // Camera position, orientation axes, and frustum — always shown.
-                    // When no extrinsics: camera sits at the origin with identity rotation.
-                    let cam_t = self.extrinsics.as_ref().map(|e| e.t).unwrap_or([0.0, 0.0, 0.0]);
-                    let cam_r = self.extrinsics.as_ref().map(|e| e.r).unwrap_or([
-                        [1.0, 0.0, 0.0],
-                        [0.0, 1.0, 0.0],
-                        [0.0, 0.0, 1.0],
-                    ]);
-                    let [tx, ty, tz] = cam_t;
-                    // Transform a camera-local point into world frame: p_world = R * p_cam + t
-                    let cam_to_world = |p: [f32; 3]| -> [f32; 3] {
-                        [
-                            cam_r[0][0] * p[0] + cam_r[0][1] * p[1] + cam_r[0][2] * p[2] + tx,
-                            cam_r[1][0] * p[0] + cam_r[1][1] * p[1] + cam_r[1][2] * p[2] + ty,
-                            cam_r[2][0] * p[0] + cam_r[2][1] * p[1] + cam_r[2][2] * p[2] + tz,
-                        ]
+                    // When no extrinsics: camera sits at origin and camera frame equals world frame.
+                    let identity_ext = CameraExtrinsics {
+                        r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                        t: [0.0, 0.0, 0.0],
                     };
+                    let ext = self.extrinsics.unwrap_or(identity_ext);
+                    let [tx, ty, tz] = ext.t;
                     if let Some(origin_px) = project(tx, ty, tz) {
                         let axis_len: f32 = 0.3; // metres
-                        // Column j of R gives the world-frame direction of camera local axis j.
-                        // X axis (red)
-                        let x_tip = [
-                            tx + cam_r[0][0] * axis_len,
-                            ty + cam_r[1][0] * axis_len,
-                            tz + cam_r[2][0] * axis_len,
+                        // Camera-local axis tips pushed through ext.apply land in world frame.
+                        let axes: [([f32; 3], egui::Color32); 3] = [
+                            ([axis_len, 0.0, 0.0], egui::Color32::from_rgb(255, 60, 60)), // X red
+                            ([0.0, axis_len, 0.0], egui::Color32::from_rgb(60, 220, 60)), // Y green
+                            ([0.0, 0.0, axis_len], egui::Color32::from_rgb(60, 100, 255)), // Z blue
                         ];
-                        if let Some(tip) = project(x_tip[0], x_tip[1], x_tip[2]) {
-                            painter.line_segment(
-                                [origin_px, tip],
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 60)),
-                            );
-                        }
-                        // Y axis (green)
-                        let y_tip = [
-                            tx + cam_r[0][1] * axis_len,
-                            ty + cam_r[1][1] * axis_len,
-                            tz + cam_r[2][1] * axis_len,
-                        ];
-                        if let Some(tip) = project(y_tip[0], y_tip[1], y_tip[2]) {
-                            painter.line_segment(
-                                [origin_px, tip],
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 220, 60)),
-                            );
-                        }
-                        // Z axis / look direction (blue)
-                        let z_tip = [
-                            tx + cam_r[0][2] * axis_len,
-                            ty + cam_r[1][2] * axis_len,
-                            tz + cam_r[2][2] * axis_len,
-                        ];
-                        if let Some(tip) = project(z_tip[0], z_tip[1], z_tip[2]) {
-                            painter.line_segment(
-                                [origin_px, tip],
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 100, 255)),
-                            );
+                        for (dir_cam, color) in axes {
+                            let w = ext.apply(dir_cam);
+                            if let Some(tip) = project(w[0], w[1], w[2]) {
+                                painter.line_segment(
+                                    [origin_px, tip],
+                                    egui::Stroke::new(2.0, color),
+                                );
+                            }
                         }
 
                         // Frustum — D435 at 640×480: fx≈615, fy≈615
@@ -1216,7 +1189,8 @@ impl eframe::App for App {
                         let frust_depth: f32 = 2.0; // metres to far plane
                         let hx = 0.520 * frust_depth;
                         let hy = 0.390 * frust_depth;
-                        // Corners in camera-local frame (X right, Y down, Z forward)
+                        // Corners in camera-local frame (X right, Y down, Z forward). ext.apply
+                        // lifts them into the Y-up world frame.
                         let corners_cam: [[f32; 3]; 4] = [
                             [ hx,  hy, frust_depth], // bottom-right
                             [ hx, -hy, frust_depth], // top-right
@@ -1229,7 +1203,7 @@ impl eframe::App for App {
                         let corners_px: Vec<Option<egui::Pos2>> = corners_cam
                             .iter()
                             .map(|&c| {
-                                let w = cam_to_world(c);
+                                let w = ext.apply(c);
                                 project(w[0], w[1], w[2])
                             })
                             .collect();
