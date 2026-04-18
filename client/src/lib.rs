@@ -1401,7 +1401,8 @@ impl eframe::App for App {
                     }
                     if !is_locked && response.hovered() {
                         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                        self.scene_zoom = (self.scene_zoom - scroll * 0.01).clamp(0.5, 20.0);
+                        self.scene_zoom =
+                            (self.scene_zoom * (-scroll * 0.0015).exp()).clamp(0.5, 20.0);
                     }
 
                     let painter = ui.painter_at(rect);
