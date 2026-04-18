@@ -144,6 +144,9 @@ struct App {
     scene_yaw: f32,
     scene_pitch: f32,
     scene_zoom: f32,
+    /// When true, projection scale grows with `scene_zoom` so the sculpture
+    /// stays roughly constant size on screen as the camera zooms.
+    scene_constant_size: bool,
     // Window visibility
     show_cameras: bool,
     show_scene: bool,
@@ -356,6 +359,7 @@ impl App {
             scene_yaw: 108.0_f32.to_radians(),
             scene_pitch: 12.0_f32.to_radians(),
             scene_zoom: 2.4,
+            scene_constant_size: false,
             show_cameras: true,
             show_scene: true,
             show_patterns: true,
@@ -1433,14 +1437,35 @@ impl eframe::App for App {
                         egui::Color32::from_gray(100),
                     );
 
+                    let toggle_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.right() - 130.0, rect.top() + 2.0),
+                        egui::vec2(124.0, 18.0),
+                    );
+                    ui.put(
+                        toggle_rect,
+                        egui::Checkbox::new(
+                            &mut self.scene_constant_size,
+                            "Constant size",
+                        ),
+                    );
+
                     // World frame = pixo: X=right, Y=up, Z=forward (right-handed OpenGL).
                     // Orbit camera: eye = Zoom * (cos(yaw)cos(pitch), sin(pitch), sin(yaw)cos(pitch)),
                     // looking at origin with WorldUp = (0, 1, 0). Transcribed from pixo's IsoCamera.
                     let cx = rect.center().x;
                     let cy = rect.center().y;
-                    let scale = 500.0_f32; // pixels per metre at unit depth
                     let (yaw, pitch, dist) =
                         (self.scene_yaw, self.scene_pitch, self.scene_zoom);
+                    // In constant-size mode, scale grows linearly with `dist` so
+                    // perspective shrinkage (~1/dist) is exactly cancelled. `d_ref`
+                    // pins today's apparent size at the default zoom.
+                    let scale_base = 500.0_f32;
+                    let d_ref = 2.4_f32;
+                    let scale = if self.scene_constant_size {
+                        scale_base * (dist / d_ref)
+                    } else {
+                        scale_base
+                    };
                     let (cp, sp) = (pitch.cos(), pitch.sin());
                     let (cyw, sy) = (yaw.cos(), yaw.sin());
                     let eye = [dist * cyw * cp, dist * sp, dist * sy * cp];
@@ -1483,8 +1508,8 @@ impl eframe::App for App {
 
                     // LEDs — rendered as real 5mm cubes in a GL pass with a depth buffer
                     // so closer LEDs correctly occlude farther ones. Projection matches the
-                    // 2D `project()` closure above (fovy = 2·atan(H/1000), scale = 500 px/m)
-                    // so tracking dots and camera axes overlay-align with the LED cubes.
+                    // 2D `project()` closure above (scale = 0.5·rh / tan(fovy/2)) so
+                    // tracking dots and camera axes overlay-align with the LED cubes.
                     if let Some(renderer) = self.scene_renderer.clone() {
                         let has_colors = self.led_colors.len() == self.leds.len()
                             && !self.leds.is_empty();
@@ -1506,7 +1531,11 @@ impl eframe::App for App {
                             );
                             let rw = rect.width().max(1.0);
                             let rh = rect.height().max(1.0);
-                            let fovy = 2.0 * (rh / 1000.0).atan();
+                            // Derive fovy from the same `scale` used by the 2D overlay
+                            // projection so the GL cubes stay aligned with axes/dots and
+                            // shrink/grow with the camera identically (i.e. not at all,
+                            // since `scale` is proportional to `dist`).
+                            let fovy = 2.0 * (rh / (2.0 * scale)).atan();
                             let aspect = rw / rh;
                             let proj = scene3d::perspective(fovy, aspect, 0.01, 100.0);
                             let mvp = scene3d::mul_mat4(&proj, &view);
