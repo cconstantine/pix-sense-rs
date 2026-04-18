@@ -1,5 +1,8 @@
 use chrono::Utc;
-use pix_sense_common::{CameraExtrinsics, DetectionAlgo, DetectionConfig, Pattern, PatternUpdate, StreamSelection};
+use pix_sense_common::{
+    CameraExtrinsics, DetectionAlgo, DetectionConfig, Pattern, PatternUpdate, SculptureSettings,
+    StreamSelection,
+};
 use sqlx::{PgPool, Row as _};
 
 /// Initialise a connection pool from the `DATABASE_URL` environment variable,
@@ -383,4 +386,39 @@ pub async fn get_active_pattern(pool: &PgPool, sculpture_name: &str) -> Option<S
         .await
         .ok()??;
     Some(row.get("active_pattern"))
+}
+
+/// Fetch brightness/gamma for a sculpture. Returns None if no settings row exists.
+pub async fn get_sculpture_settings(
+    pool: &PgPool,
+    sculpture_name: &str,
+) -> Option<SculptureSettings> {
+    let row = sqlx::query("SELECT brightness, gamma FROM sculpture_settings WHERE name = $1")
+        .bind(sculpture_name)
+        .fetch_optional(pool)
+        .await
+        .ok()??;
+    Some(SculptureSettings {
+        brightness: row.get("brightness"),
+        gamma: row.get("gamma"),
+    })
+}
+
+/// Update brightness/gamma for an existing sculpture. Returns `true` if a row
+/// was updated. Does not create the row — a settings row is created lazily
+/// by `set_active_pattern` on first activation.
+pub async fn update_sculpture_settings(
+    pool: &PgPool,
+    sculpture_name: &str,
+    settings: &SculptureSettings,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE sculpture_settings SET brightness = $2, gamma = $3 WHERE name = $1",
+    )
+    .bind(sculpture_name)
+    .bind(settings.brightness)
+    .bind(settings.gamma)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }

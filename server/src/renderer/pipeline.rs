@@ -365,12 +365,30 @@ impl RendererPipeline {
         gl: &glow::Context,
         person_pos: Option<[f32; 3]>,
         overscan: bool,
+        brightness: f32,
+        gamma: f32,
     ) {
         if self.num_leds == 0 {
             return;
         }
 
         let vp = build_view_proj(person_pos, self.led_centroid, self.led_scope, overscan);
+
+        // Distance-compensation inputs for the LED-projection vertex shader.
+        // `cam_r` is the distance from the world origin to the tracked person;
+        // compensation is disabled when no person is tracked or the tracked
+        // point coincides with the origin (cam_r → 0).
+        let (cam_pos, inv_cam_r_sq, comp_enabled) = match person_pos {
+            Some(p) => {
+                let r_sq = p[0] * p[0] + p[1] * p[1] + p[2] * p[2];
+                if r_sq > 1e-12 {
+                    (p, 1.0 / r_sq, 1.0_f32)
+                } else {
+                    (p, 0.0, 0.0)
+                }
+            }
+            None => ([0.0; 3], 0.0, 0.0),
+        };
 
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.led_output_fbo));
@@ -390,6 +408,21 @@ impl RendererPipeline {
             }
             if let Some(loc) = gl.get_uniform_location(self.led_proj_program, "canvas_size") {
                 gl.uniform_2_f32(Some(&loc), self.canvas_w as f32, self.canvas_h as f32);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.led_proj_program, "camera_pos") {
+                gl.uniform_3_f32(Some(&loc), cam_pos[0], cam_pos[1], cam_pos[2]);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.led_proj_program, "inv_cam_r_sq") {
+                gl.uniform_1_f32(Some(&loc), inv_cam_r_sq);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.led_proj_program, "comp_enabled") {
+                gl.uniform_1_f32(Some(&loc), comp_enabled);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.led_proj_program, "brightness") {
+                gl.uniform_1_f32(Some(&loc), brightness);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.led_proj_program, "gamma") {
+                gl.uniform_1_f32(Some(&loc), gamma);
             }
 
             gl.bind_vertex_array(Some(self.led_vao));
@@ -478,14 +511,11 @@ impl RendererPipeline {
     }
 
     // -----------------------------------------------------------------------
-    // Extract per-LED RGB values from RGBA canvas data, applying brightness/gamma
+    // Extract per-LED RGB values from RGBA canvas data.  Brightness, gamma,
+    // and distance compensation are all applied in the LED projection shader,
+    // so this is a pure byte-level extraction.
     // -----------------------------------------------------------------------
-    pub fn extract_led_rgb(
-        rgba: &[u8],
-        num_leds: usize,
-        brightness: f32,
-        gamma: f32,
-    ) -> Vec<u8> {
+    pub fn extract_led_rgb(rgba: &[u8], num_leds: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(num_leds * 3);
         for i in 0..num_leds {
             let base = i * 4;
@@ -493,12 +523,9 @@ impl RendererPipeline {
                 out.extend_from_slice(&[0, 0, 0]);
                 continue;
             }
-            let r = apply_brightness_gamma(rgba[base],     brightness, gamma);
-            let g = apply_brightness_gamma(rgba[base + 1], brightness, gamma);
-            let b = apply_brightness_gamma(rgba[base + 2], brightness, gamma);
-            out.push(r);
-            out.push(g);
-            out.push(b);
+            out.push(rgba[base]);
+            out.push(rgba[base + 1]);
+            out.push(rgba[base + 2]);
         }
         out
     }
@@ -507,11 +534,6 @@ impl RendererPipeline {
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
-
-fn apply_brightness_gamma(v: u8, brightness: f32, gamma: f32) -> u8 {
-    let f = (v as f32 / 255.0).powf(gamma) * brightness;
-    (f.clamp(0.0, 1.0) * 255.0) as u8
-}
 
 /// Build a perspective view-projection matrix from `person_pos` looking toward
 /// the LED centroid.  Returns a column-major `[f32; 16]` for OpenGL.

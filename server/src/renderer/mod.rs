@@ -1,4 +1,5 @@
 mod context;
+mod opc;
 mod pipeline;
 mod shaders;
 
@@ -101,15 +102,17 @@ fn run_inner(
         });
     }
 
-    // --- Per-device LED offsets (OPC disabled) ---
-    let device_offsets: Vec<usize> = {
+    // --- Spawn OPC sender tasks (async, on the local rt) ---
+    let opc_senders: Vec<(tokio::sync::mpsc::Sender<Vec<u8>>, usize)> = {
+        let _guard = rt.enter(); // set runtime context so tokio::spawn works
         let mut offset = 0;
-        let mut offsets = Vec::with_capacity(leds_by_device.len());
-        for (_, leds) in &leds_by_device {
-            offsets.push(offset);
+        let mut senders = Vec::with_capacity(leds_by_device.len());
+        for (addr, leds) in &leds_by_device {
+            let tx = opc::spawn(addr.clone(), running.clone());
+            senders.push((tx, offset));
             offset += leds.len();
         }
-        offsets
+        senders
     };
 
     // --- Create headless EGL context ---
@@ -118,6 +121,7 @@ fn run_inner(
 
     // --- Build GL pipeline ---
     let mut pipe = RendererPipeline::new(gl, &all_leds, &initial_glsl)?;
+    let mut current_glsl = initial_glsl.clone();
     let mut current_brightness = brightness;
     let mut current_gamma = gamma;
     let mut current_overscan = overscan;
@@ -132,11 +136,16 @@ fn run_inner(
             break;
         }
 
-        // Check for shader/settings hot-reload.
+        // Check for shader/settings hot-reload. Only rebuild the shader if the
+        // GLSL string actually changed — rebuilding resets the `time` uniform,
+        // which visibly jerks the pattern on every brightness/gamma slider tick.
         if reload_flag.swap(false, Ordering::AcqRel) {
             let glsl = new_glsl.lock().unwrap().clone();
             let (b, g, o) = *new_render_settings.lock().unwrap();
-            pipe.reload_pattern_shader(gl, &glsl);
+            if glsl != current_glsl {
+                pipe.reload_pattern_shader(gl, &glsl);
+                current_glsl = glsl;
+            }
             current_brightness = b;
             current_gamma = g;
             current_overscan = o;
@@ -148,30 +157,37 @@ fn run_inner(
         // Pass 1: render GLSL pattern to 512×512 texture.
         pipe.render_pattern(gl, location.unwrap_or([0.0, 0.0, 0.0]));
 
-        // Pass 2: project LED positions onto pattern.
-        pipe.render_leds(gl, location, current_overscan);
+        // Pass 2: project LED positions onto pattern (applies brightness,
+        // gamma, and distance compensation in the shader).
+        pipe.render_leds(
+            gl,
+            location,
+            current_overscan,
+            current_brightness,
+            current_gamma,
+        );
 
         // PBO readback (returns previous frame's data — 1-frame latency).
         if let Some(rgba) = pipe.pbo_readback(gl) {
             // Collect all LED RGB values in device order (matches /api/leds order).
             let mut all_rgb: Vec<[u8; 3]> = Vec::with_capacity(pipe.num_leds);
 
-            // For each FadeCandy device, extract its LED slice for the WebSocket broadcast.
-            for (i, offset) in device_offsets.iter().enumerate() {
-                let next = device_offsets
+            // For each FadeCandy device, extract its LED slice, append to the
+            // WebSocket broadcast buffer, and send via OPC.
+            for (i, (tx, offset)) in opc_senders.iter().enumerate() {
+                let next = opc_senders
                     .get(i + 1)
-                    .copied()
+                    .map(|(_, o)| *o)
                     .unwrap_or(pipe.num_leds);
                 let n_leds = next - offset;
                 let rgb = RendererPipeline::extract_led_rgb(
                     &rgba[offset * 4..],
                     n_leds,
-                    current_brightness,
-                    current_gamma,
                 );
                 for chunk in rgb.chunks_exact(3) {
                     all_rgb.push([chunk[0], chunk[1], chunk[2]]);
                 }
+                let _ = tx.try_send(rgb); // drop frame on backpressure
             }
 
             // Broadcast LED colors to WebSocket clients via the watch channel.
@@ -188,7 +204,7 @@ fn run_inner(
         // Drive the Tokio reactor (OPC tasks, settings watcher) without blocking.
         rt.block_on(tokio::task::yield_now());
 
-        // Sleep to target ~30 fps.
+        // Sleep to target frame rate.
         let elapsed = t_start.elapsed();
         if elapsed < FRAME_DURATION {
             std::thread::sleep(FRAME_DURATION - elapsed);

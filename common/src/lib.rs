@@ -180,6 +180,15 @@ pub struct PatternUpdate {
     pub overscan: bool,
 }
 
+/// Per-sculpture display settings applied to the rendered LED output.
+/// `brightness` is a linear multiplier (1.0 = unchanged); `gamma` is the
+/// decoding exponent applied before the multiply (2.2 for sRGB-ish output).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct SculptureSettings {
+    pub brightness: f32,
+    pub gamma: f32,
+}
+
 pub fn encode_frame_message(
     rgb_jpeg: &[u8],
     ir_jpeg: &[u8],

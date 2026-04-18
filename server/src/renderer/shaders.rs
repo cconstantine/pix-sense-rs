@@ -26,16 +26,21 @@ out vec4 fragColor;
 /// Each vertex represents one LED.  The shader:
 ///   1. Projects the LED's world position through `view_proj` (person's viewpoint).
 ///   2. Maps clip coords → UV, samples the pattern texture.
-///   3. Positions the output GL_POINT at the LED's slot in the output canvas.
+///   3. Computes pixo-style distance compensation `(led_r / cam_r)^2`.
+///   4. Positions the output GL_POINT at the LED's slot in the output canvas.
 pub const LED_PROJ_VERT: &str = r#"#version 300 es
 layout(location = 0) in vec3 led_world_pos;
 layout(location = 1) in float led_index;
 
-uniform mat4      view_proj;    // perspective from person's viewpoint
-uniform sampler2D pattern_tex;  // 512x512 rendered pattern
-uniform vec2      canvas_size;  // output canvas dimensions (e.g. vec2(32.0, 32.0))
+uniform mat4      view_proj;     // perspective from person's viewpoint
+uniform sampler2D pattern_tex;   // 512x512 rendered pattern
+uniform vec2      canvas_size;   // output canvas dimensions (e.g. vec2(32.0, 32.0))
+uniform vec3      camera_pos;    // tracked person world position
+uniform float     inv_cam_r_sq;  // 1.0 / |camera_pos|^2, precomputed CPU-side
+uniform float     comp_enabled;  // 1.0 when tracking + origin normalisation valid, else 0.0
 
-out vec4 led_color;
+out vec4  led_color;
+out float distance_compensation;
 
 void main() {
     // Project LED world position to clip space via the person's view frustum.
@@ -52,6 +57,12 @@ void main() {
                && all(lessThanEqual   (uv, vec2(1.0)));
     led_color = inside ? texture(pattern_tex, uv) : vec4(0.0, 0.0, 0.0, 1.0);
 
+    // Per-LED distance compensation: (led_r / cam_r)^2 (pixo's led_mesh shader).
+    // `cam_r` is |camera_pos|, i.e. the world origin is the reference point.
+    vec3  d        = camera_pos - led_world_pos;
+    float led_r_sq = dot(d, d);
+    distance_compensation = mix(1.0, led_r_sq * inv_cam_r_sq, comp_enabled);
+
     // Compute the pixel column and row for this LED in the output canvas.
     float col = mod(led_index, canvas_size.x);
     float row = floor(led_index / canvas_size.x);
@@ -65,12 +76,19 @@ void main() {
 }
 "#;
 
-/// Fragment shader for Pass 2.  Simply outputs the color computed in the vertex shader.
+/// Fragment shader for Pass 2.  Applies gamma, brightness, and the distance
+/// compensation computed per-vertex, matching pixo's fragment shader.
 pub const LED_PROJ_FRAG: &str = r#"#version 300 es
-precision mediump float;
-in  vec4 led_color;
+precision highp float;
+in  vec4  led_color;
+in  float distance_compensation;
+
+uniform float brightness;
+uniform float gamma;
+
 out vec4 fragColor;
 void main() {
-    fragColor = led_color;
+    vec3 c = pow(led_color.rgb, vec3(gamma)) * brightness * distance_compensation;
+    fragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }
 "#;

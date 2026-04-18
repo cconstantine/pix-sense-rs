@@ -21,7 +21,8 @@ use axum::{
 use image::RgbImage;
 use pix_sense_common::{
     encode_frame_message, CalibrationPoint, CameraExtrinsics, ClientMessage, DetectionConfig,
-    FaceDetection, FrameMetadata, LedPoint, Pattern, PatternUpdate, ServerMessage, TrackingPoint,
+    FaceDetection, FrameMetadata, LedPoint, Pattern, PatternUpdate, SculptureSettings,
+    ServerMessage, TrackingPoint,
 };
 use sqlx::{PgPool, Row as _};
 use tokio::sync::{broadcast, watch};
@@ -159,9 +160,11 @@ impl RoiTracker {
         [x1, y1, x2, y2]
     }
 
-    /// Feed back this frame's detections (already in full-image coordinates).
-    fn update(&mut self, detections: &[FaceDetection]) {
-        if detections.is_empty() {
+    /// Feed back this frame's target face (already in full-image coordinates).
+    /// Pass `None` when there's no face to center on — the tracker will coast
+    /// for `max_coast_frames` and then fall into scanning mode.
+    fn update(&mut self, target: Option<&FaceDetection>) {
+        let Some(face) = target else {
             self.frames_without_detection += 1;
             if self.frames_without_detection >= self.max_coast_frames || self.center.is_none() {
                 // Switch to / stay in scanning mode.
@@ -169,17 +172,12 @@ impl RoiTracker {
                 self.scan_index += 1;
             }
             return;
-        }
+        };
 
         self.frames_without_detection = 0;
 
-        // Track the highest-confidence detection.
-        let best = detections
-            .iter()
-            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
-            .unwrap();
-        let new_cx = (best.bbox[0] + best.bbox[2]) / 2.0;
-        let new_cy = (best.bbox[1] + best.bbox[3]) / 2.0;
+        let new_cx = (face.bbox[0] + face.bbox[2]) / 2.0;
+        let new_cy = (face.bbox[1] + face.bbox[3]) / 2.0;
 
         match self.center {
             Some((old_cx, old_cy)) => {
@@ -219,6 +217,10 @@ struct AppState {
     pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
     /// Calibration point pairs collected in this session (in-memory, not persisted).
     calib_points: Arc<Mutex<Vec<CalibrationPoint>>>,
+    /// Latest (cam-frame, world-frame) XYZ pair of the currently-tracked person.
+    /// Written by the processing thread each frame; read by the `capture_tracked`
+    /// calibration handler. `None` if no person is being tracked.
+    tracked_pair_rx: watch::Receiver<Option<([f32; 3], [f32; 3])>>,
     /// RealSense serial number — used as the DB key for extrinsics.
     camera_id: Arc<String>,
     /// Sculpture name from SCULPTURE_NAME env var — used for pattern activation.
@@ -303,6 +305,12 @@ async fn main() -> Result<()> {
 
     let metrics = Arc::new(Metrics::new());
 
+    // Watch channel for the currently-tracked person's (cam-frame, world-frame) XYZ
+    // pair. Written once per frame by the processing thread; read by the calibration
+    // `capture_tracked` HTTP handler. `None` means no person is being tracked.
+    let (tracked_pair_tx, tracked_pair_rx) =
+        watch::channel::<Option<([f32; 3], [f32; 3])>>(None);
+
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     let config_clone = config.clone();
@@ -319,6 +327,7 @@ async fn main() -> Result<()> {
             db_tx,
             extrinsics_clone,
             pending_selection_clone,
+            tracked_pair_tx,
             metrics_clone,
         ) {
             tracing::error!("Processing thread error: {:#}", e);
@@ -380,6 +389,7 @@ async fn main() -> Result<()> {
         extrinsics,
         pending_selection,
         calib_points,
+        tracked_pair_rx,
         camera_id,
         sculpture_name,
     };
@@ -401,6 +411,10 @@ async fn main() -> Result<()> {
                 .delete(clear_points_handler),
         )
         .route("/api/calibration/compute", post(compute_extrinsics_handler))
+        .route(
+            "/api/calibration/capture_tracked",
+            post(capture_tracked_handler),
+        )
         // Pattern management
         .route(
             "/api/patterns",
@@ -414,6 +428,11 @@ async fn main() -> Result<()> {
                 .delete(delete_pattern_handler),
         )
         .route("/api/patterns/{name}/activate", post(activate_pattern_handler))
+        // Sculpture display settings (brightness, gamma)
+        .route(
+            "/api/settings",
+            get(get_settings_handler).put(put_settings_handler),
+        )
         .route("/metrics", get(metrics_handler))
         .fallback_service(ServeDir::new("client/dist"))
         .with_state(state);
@@ -714,6 +733,33 @@ async fn clear_points_handler(State(state): State<AppState>) -> impl IntoRespons
     StatusCode::NO_CONTENT
 }
 
+/// POST /api/calibration/capture_tracked — snapshots the currently-tracked
+/// person's (cam-frame, world-frame) XYZ into a new calibration pair.
+///
+/// Returns 409 if no person is currently being tracked. Used by the
+/// "stand-in-view" calibration flow where the operator physically stands at a
+/// known spot, aligns their tracked marker via the translation sliders, then
+/// captures. The returned `world` half reflects the current extrinsics.
+async fn capture_tracked_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let pair = *state.tracked_pair_rx.borrow();
+    let Some((cam, world)) = pair else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "No person currently tracked" })),
+        )
+            .into_response();
+    };
+    let pt = CalibrationPoint { cam, world };
+    let mut pts = state.calib_points.lock().unwrap();
+    pts.push(pt);
+    let count = pts.len();
+    tracing::info!(
+        "Calibration point captured from tracking ({} total): cam={:?} world={:?}",
+        count, cam, world
+    );
+    Json(pt).into_response()
+}
+
 /// POST /api/calibration/compute — runs Umeyama SVD on the collected point pairs,
 /// saves the result to memory and DB, and returns the computed extrinsics as JSON.
 /// Returns 400 if fewer than 3 point pairs are available.
@@ -921,6 +967,38 @@ async fn get_active_pattern_handler(State(state): State<AppState>) -> impl IntoR
     }
 }
 
+async fn get_settings_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match db::get_sculpture_settings(pool, &state.sculpture_name).await {
+        Some(s) => Json(s).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+async fn put_settings_handler(
+    State(state): State<AppState>,
+    Json(settings): Json<SculptureSettings>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.db_pool else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    // Clamp to sane ranges so a slider bug can't blast the LEDs or make them invisible.
+    let clamped = SculptureSettings {
+        brightness: settings.brightness.clamp(0.0, 4.0),
+        gamma: settings.gamma.clamp(0.1, 5.0),
+    };
+    match db::update_sculpture_settings(pool, &state.sculpture_name, &clamped).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::warn!("update_sculpture_settings error: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn metrics_handler() -> impl IntoResponse {
     let encoder = TextEncoder::new();
     let families = prometheus::gather();
@@ -942,6 +1020,7 @@ fn processing_thread(
     db_tx: tokio::sync::mpsc::UnboundedSender<Vec<[f32; 3]>>,
     extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
     pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
+    tracked_pair_tx: watch::Sender<Option<([f32; 3], [f32; 3])>>,
     metrics: Arc<Metrics>,
 ) -> Result<()> {
     // Load models first — CUDA graph compilation can take a while,
@@ -998,12 +1077,6 @@ fn processing_thread(
             roi_rect,
         );
 
-        // Update ROI tracker with the active stream's detections.
-        match cfg.stream {
-            StreamSelection::Rgb => roi_tracker.update(&rgb_faces_raw),
-            StreamSelection::Ir => roi_tracker.update(&ir_faces_raw),
-        }
-
         // Attach XYZ coordinates to every detection
         let rgb_faces: Vec<_> = rgb_faces_raw
             .into_iter()
@@ -1033,24 +1106,26 @@ fn processing_thread(
             })
             .collect();
 
-        // Build indexed world-frame positions with source tracking so we can
-        // identify which face in which stream the PersonSelector picks.
-        let face_refs: Vec<(bool, usize, [f32; 3])> = {
+        // Build indexed (cam-frame, world-frame) positions with source tracking so
+        // we can identify which face in which stream the PersonSelector picks, and
+        // so calibration's `capture_tracked` endpoint can read the cam-frame XYZ
+        // without a second lookup.
+        let face_refs: Vec<(bool, usize, [f32; 3], [f32; 3])> = {
             let ext = extrinsics.read().unwrap();
             let mut refs = Vec::new();
             for (i, f) in rgb_faces.iter().enumerate() {
                 if let Some(p) = f.xyz {
-                    refs.push((true, i, ext.as_ref().map_or(p, |e| e.apply(p))));
+                    refs.push((true, i, p, ext.as_ref().map_or(p, |e| e.apply(p))));
                 }
             }
             for (i, f) in ir_faces.iter().enumerate() {
                 if let Some(p) = f.xyz {
-                    refs.push((false, i, ext.as_ref().map_or(p, |e| e.apply(p))));
+                    refs.push((false, i, p, ext.as_ref().map_or(p, |e| e.apply(p))));
                 }
             }
             refs
         };
-        let world_xyzs: Vec<[f32; 3]> = face_refs.iter().map(|&(_, _, xyz)| xyz).collect();
+        let world_xyzs: Vec<[f32; 3]> = face_refs.iter().map(|&(_, _, _, xyz)| xyz).collect();
 
         // Apply any pending manual selection from the UI before the selector runs.
         if let Some(target) = pending_selection.lock().unwrap().take() {
@@ -1060,15 +1135,38 @@ fn processing_thread(
         let (tracked_rgb_idx, tracked_ir_idx) =
             if let Some((sel_idx, selected)) = person_selector.select(&world_xyzs) {
                 let _ = db_tx.send(vec![selected]);
-                let (is_rgb, face_idx, _) = face_refs[sel_idx];
+                let (is_rgb, face_idx, cam, _) = face_refs[sel_idx];
+                let _ = tracked_pair_tx.send(Some((cam, selected)));
                 if is_rgb {
                     (Some(face_idx), None)
                 } else {
                     (None, Some(face_idx))
                 }
             } else {
+                let _ = tracked_pair_tx.send(None);
                 (None, None)
             };
+
+        // Center the ROI on the tracked person so detection stays locked on
+        // them across frames. Fall back to the highest-confidence face when
+        // no one is locked yet, so the detector can still acquire faces
+        // before the PersonSelector has picked a target.
+        let active_faces: &[FaceDetection] = match cfg.stream {
+            StreamSelection::Rgb => &rgb_faces,
+            StreamSelection::Ir => &ir_faces,
+        };
+        let tracked_idx = match cfg.stream {
+            StreamSelection::Rgb => tracked_rgb_idx,
+            StreamSelection::Ir => tracked_ir_idx,
+        };
+        let roi_target = tracked_idx
+            .and_then(|i| active_faces.get(i))
+            .or_else(|| {
+                active_faces
+                    .iter()
+                    .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
+            });
+        roi_tracker.update(roi_target);
 
         let data = FrameData {
             rgb: frames.rgb,

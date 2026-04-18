@@ -4,8 +4,8 @@ use eframe::egui;
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 use pix_sense_common::{
     decode_frame_message, CalibrationPoint, CameraExtrinsics, ClientMessage, DetectionAlgo,
-    DetectionConfig, FaceDetection, LedPoint, Pattern, PatternUpdate, ServerMessage,
-    StreamSelection, TrackingPoint,
+    DetectionConfig, FaceDetection, LedPoint, Pattern, PatternUpdate, SculptureSettings,
+    ServerMessage, StreamSelection, TrackingPoint,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -59,6 +59,19 @@ void main() {\n\
     fragColor = vec4(uv, 0.5 + 0.5 * sin(time * 0.001), 1.0);\n\
 }\n";
 
+/// Which capture workflow is active inside the calibration side panel.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum CalibrationMode {
+    /// Operator types the world-frame XYZ and clicks a tracking dot in the 3D
+    /// scene to capture its camera-frame XYZ.
+    PickPoint,
+    /// Operator stands at a known physical spot, drags translation sliders until
+    /// their tracked marker aligns with the spot, then snapshots the currently-
+    /// tracked person's (cam, world) pair in one click. Rotation falls out of
+    /// the SVD solve once ≥3 pairs are collected.
+    StandInView,
+}
+
 struct PatternDraft {
     original_name: String,
     name: String,
@@ -111,12 +124,16 @@ struct App {
     locked_location: Option<String>,
     // Calibration state
     calib_mode: bool,
+    /// Which capture workflow is active within calibration mode.
+    calib_sub_mode: CalibrationMode,
     /// Point pairs collected so far (mirrors server-side list for this session).
     calib_points: Vec<CalibrationPoint>,
     /// World-frame XYZ typed by the user (pending pairing with a cam point).
     calib_world_input: [String; 3],
     /// Camera-frame point captured by clicking a tracking dot.
     calib_pending_cam: Option<[f32; 3]>,
+    /// Last error message from a stand-in-view capture attempt (shown briefly).
+    calib_capture_error: Rc<RefCell<Option<String>>>,
     /// Current extrinsics (None = identity / uncalibrated).
     extrinsics: Option<CameraExtrinsics>,
     /// Camera serial number fetched from server.
@@ -137,6 +154,10 @@ struct App {
     active_pattern_pending: Rc<RefCell<Option<String>>>,
     pattern_editing: Option<PatternDraft>,
     pattern_new_name: String,
+    // Display settings (LED brightness / gamma). Updates are PUT to the server
+    // while the slider is being dragged; server debounces via its DB NOTIFY path.
+    settings: SculptureSettings,
+    settings_pending: Rc<RefCell<Option<SculptureSettings>>>,
 }
 
 struct FpsCounter {
@@ -264,6 +285,19 @@ impl App {
             }
         });
 
+        // Fetch current display settings (brightness, gamma).
+        let settings_pending: Rc<RefCell<Option<SculptureSettings>>> = Rc::new(RefCell::new(None));
+        let sp_clone = settings_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(resp) = gloo_net::http::Request::get("/api/settings").send().await {
+                if resp.status() == 200 {
+                    if let Ok(s) = resp.json::<SculptureSettings>().await {
+                        *sp_clone.borrow_mut() = Some(s);
+                    }
+                }
+            }
+        });
+
         Self {
             ws_sender,
             ws_receiver,
@@ -292,9 +326,11 @@ impl App {
             show_patterns: true,
             locked_location: None,
             calib_mode: false,
+            calib_sub_mode: CalibrationMode::PickPoint,
             calib_points: Vec::new(),
             calib_world_input: [String::new(), String::new(), String::new()],
             calib_pending_cam: None,
+            calib_capture_error: Rc::new(RefCell::new(None)),
             extrinsics: None,
             camera_id: String::new(),
             extrinsics_pending,
@@ -308,6 +344,8 @@ impl App {
             active_pattern_pending,
             pattern_editing: None,
             pattern_new_name: String::new(),
+            settings: SculptureSettings { brightness: 1.0, gamma: 2.2 },
+            settings_pending,
         }
     }
 
@@ -370,6 +408,31 @@ impl App {
         if let Ok(json) = serde_json::to_string(&msg) {
             self.ws_sender.send(WsMessage::Text(json));
         }
+    }
+
+    /// Fire-and-forget PUT of the current (brightness, gamma) to the server.
+    /// The DB trigger fans out to the renderer, so the LEDs update within a frame.
+    fn push_settings(&self) {
+        let s = self.settings;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(req) = gloo_net::http::Request::put("/api/settings").json(&s) {
+                let _ = req.send().await;
+            }
+        });
+    }
+
+    /// Switch the active pattern, optimistically updating the local state.
+    fn activate_pattern(&mut self, name: String) {
+        self.active_pattern = name.clone();
+        let ap = self.active_pattern_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let url = format!("/api/patterns/{}/activate", name);
+            if let Ok(resp) = gloo_net::http::Request::post(&url).send().await {
+                if resp.status() == 204 {
+                    *ap.borrow_mut() = Some(name);
+                }
+            }
+        });
     }
 }
 
@@ -469,42 +532,55 @@ impl eframe::App for App {
         if let Some(active) = self.active_pattern_pending.borrow_mut().take() {
             self.active_pattern = active;
         }
+        if let Some(s) = self.settings_pending.borrow_mut().take() {
+            self.settings = s;
+        }
 
-        // Poll WebSocket for new frames and tracking updates
+        // Drain the WebSocket queue, keeping only the newest of each kind.
+        // While the tab is hidden egui's rAF pauses but the WebSocket keeps
+        // delivering; without this coalescing, the first update() after the tab
+        // regains focus would synchronously JPEG-decode the entire backlog.
+        let mut latest_binary: Option<Vec<u8>> = None;
+        let mut latest_tracking: Option<Vec<TrackingPoint>> = None;
+        let mut latest_led_colors: Option<Vec<[u8; 3]>> = None;
+        let mut latest_config: Option<DetectionConfig> = None;
+
         while let Some(event) = self.ws_receiver.try_recv() {
             match event {
-                WsEvent::Opened => {
-                    self.connected = true;
-                    // Server will push its current config; do not send our default.
-                }
-                WsEvent::Message(WsMessage::Binary(data)) => {
-                    self.handle_binary_message(ctx, &data);
-                }
-                WsEvent::Message(WsMessage::Text(text)) => {
-                    if let Ok(msg) = serde_json::from_str::<ServerMessage>(&text) {
-                        match msg {
-                            ServerMessage::Tracking(pts) => {
-                                self.tracking = pts;
-                            }
-                            ServerMessage::LedColors(colors) => {
-                                self.led_colors = colors;
-                            }
-                            ServerMessage::Config(cfg) => {
-                                self.local_config = cfg;
-                                self.active_config = cfg;
-                            }
-                        }
-                    }
-                }
+                WsEvent::Opened => self.connected = true,
+                WsEvent::Closed => self.connected = false,
                 WsEvent::Error(e) => {
                     tracing::warn!("WebSocket error: {}", e);
                     self.connected = false;
                 }
-                WsEvent::Closed => {
-                    self.connected = false;
+                WsEvent::Message(WsMessage::Binary(data)) => {
+                    latest_binary = Some(data);
+                }
+                WsEvent::Message(WsMessage::Text(text)) => {
+                    if let Ok(msg) = serde_json::from_str::<ServerMessage>(&text) {
+                        match msg {
+                            ServerMessage::Tracking(pts) => latest_tracking = Some(pts),
+                            ServerMessage::LedColors(colors) => latest_led_colors = Some(colors),
+                            ServerMessage::Config(cfg) => latest_config = Some(cfg),
+                        }
+                    }
                 }
                 _ => {}
             }
+        }
+
+        if let Some(data) = latest_binary {
+            self.handle_binary_message(ctx, &data);
+        }
+        if let Some(pts) = latest_tracking {
+            self.tracking = pts;
+        }
+        if let Some(colors) = latest_led_colors {
+            self.led_colors = colors;
+        }
+        if let Some(cfg) = latest_config {
+            self.local_config = cfg;
+            self.active_config = cfg;
         }
 
         // Top panel with stats and config controls
@@ -588,6 +664,55 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.show_cameras, "Cameras");
                 ui.checkbox(&mut self.show_scene, "3D Scene");
                 ui.checkbox(&mut self.show_patterns, "Patterns");
+
+                ui.separator();
+
+                // Quick pattern switcher — lets the user flip between patterns
+                // without opening the Patterns window.
+                ui.label("Pattern:");
+                let enabled_patterns: Vec<String> = self
+                    .patterns
+                    .iter()
+                    .filter(|p| p.enabled)
+                    .map(|p| p.name.clone())
+                    .collect();
+                let current_label = if self.active_pattern.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    self.active_pattern.clone()
+                };
+                let mut new_active: Option<String> = None;
+                egui::ComboBox::from_id_salt("quick_pattern_select")
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        for name in &enabled_patterns {
+                            let selected = name == &self.active_pattern;
+                            if ui.selectable_label(selected, name).clicked() && !selected {
+                                new_active = Some(name.clone());
+                            }
+                        }
+                    });
+                if let Some(name) = new_active {
+                    self.activate_pattern(name);
+                }
+
+                ui.separator();
+
+                // Brightness / gamma sliders. Push on every change — the server
+                // clamps and the renderer picks it up through the DB NOTIFY path.
+                ui.label("Brightness:");
+                let b_resp = ui.add(
+                    egui::Slider::new(&mut self.settings.brightness, 0.0..=2.0)
+                        .fixed_decimals(2),
+                );
+                let g_resp = ui.add(
+                    egui::Slider::new(&mut self.settings.gamma, 0.5..=3.0)
+                        .text("γ")
+                        .fixed_decimals(2),
+                );
+                if b_resp.changed() || g_resp.changed() {
+                    self.push_settings();
+                }
             });
         });
 
@@ -787,10 +912,32 @@ impl eframe::App for App {
 
                             ui.checkbox(&mut self.calib_mode, "Calibration mode");
                             if self.calib_mode {
-                                ui.colored_label(
-                                    egui::Color32::YELLOW,
-                                    "Click a tracking point\nin the scene to capture it",
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut self.calib_sub_mode,
+                                        CalibrationMode::PickPoint,
+                                        "Pick point",
+                                    );
+                                    ui.radio_value(
+                                        &mut self.calib_sub_mode,
+                                        CalibrationMode::StandInView,
+                                        "Stand in view",
+                                    );
+                                });
+                                match self.calib_sub_mode {
+                                    CalibrationMode::PickPoint => {
+                                        ui.colored_label(
+                                            egui::Color32::YELLOW,
+                                            "Click a tracking point\nin the scene to capture it",
+                                        );
+                                    }
+                                    CalibrationMode::StandInView => {
+                                        ui.colored_label(
+                                            egui::Color32::YELLOW,
+                                            "Stand at a known spot,\nalign via translation sliders,\nthen capture.",
+                                        );
+                                    }
+                                }
                             }
 
                             ui.separator();
@@ -806,65 +953,142 @@ impl eframe::App for App {
                             ui.label(format!("{} pair(s) collected", self.calib_points.len()));
 
                             ui.separator();
-                            ui.label("World XYZ (m, Y+ up, pixo frame):");
-                            ui.horizontal(|ui| {
-                                for (hint, val) in ["X", "Y", "Z"]
-                                    .iter()
-                                    .zip(self.calib_world_input.iter_mut())
-                                {
-                                    ui.add(
-                                        egui::TextEdit::singleline(val)
-                                            .hint_text(*hint)
-                                            .desired_width(52.0),
+                            match self.calib_sub_mode {
+                                CalibrationMode::PickPoint => {
+                                    ui.label("World XYZ (m, Y+ up, pixo frame):");
+                                    ui.horizontal(|ui| {
+                                        for (hint, val) in ["X", "Y", "Z"]
+                                            .iter()
+                                            .zip(self.calib_world_input.iter_mut())
+                                        {
+                                            ui.add(
+                                                egui::TextEdit::singleline(val)
+                                                    .hint_text(*hint)
+                                                    .desired_width(52.0),
+                                            );
+                                        }
+                                    });
+
+                                    ui.add_space(4.0);
+                                    if let Some(cam) = self.calib_pending_cam {
+                                        ui.label(format!(
+                                            "Cam: ({:.3}, {:.3}, {:.3})",
+                                            cam[0], cam[1], cam[2]
+                                        ));
+
+                                        let can_add = self.calib_world_input.iter().all(|s| {
+                                            s.trim().parse::<f32>().is_ok()
+                                        });
+                                        if ui
+                                            .add_enabled(can_add, egui::Button::new("Add pair"))
+                                            .clicked()
+                                        {
+                                            let wx = self.calib_world_input[0]
+                                                .trim()
+                                                .parse::<f32>()
+                                                .unwrap();
+                                            let wy = self.calib_world_input[1]
+                                                .trim()
+                                                .parse::<f32>()
+                                                .unwrap();
+                                            let wz = self.calib_world_input[2]
+                                                .trim()
+                                                .parse::<f32>()
+                                                .unwrap();
+                                            let pt = CalibrationPoint {
+                                                cam,
+                                                world: [wx, wy, wz],
+                                            };
+                                            self.calib_points.push(pt);
+                                            self.calib_pending_cam = None;
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                let _ = gloo_net::http::Request::post(
+                                                    "/api/calibration/points",
+                                                )
+                                                .json(&pt)
+                                                .expect("serialize CalibrationPoint")
+                                                .send()
+                                                .await;
+                                            });
+                                        }
+                                        if ui.small_button("Cancel").clicked() {
+                                            self.calib_pending_cam = None;
+                                        }
+                                    } else {
+                                        ui.colored_label(
+                                            egui::Color32::from_gray(140),
+                                            "No cam point selected",
+                                        );
+                                    }
+                                }
+                                CalibrationMode::StandInView => {
+                                    let tracked = self.tracked_rgb_idx.is_some()
+                                        || self.tracked_ir_idx.is_some();
+                                    if tracked {
+                                        ui.colored_label(egui::Color32::GREEN, "Tracked");
+                                    } else {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 90, 90),
+                                            "Not tracked",
+                                        );
+                                    }
+
+                                    if ui
+                                        .add_enabled(tracked, egui::Button::new("Capture pair"))
+                                        .clicked()
+                                    {
+                                        let err_cell = self.calib_capture_error.clone();
+                                        let points_cell = self.points_pending.clone();
+                                        wasm_bindgen_futures::spawn_local(async move {
+                                            match gloo_net::http::Request::post(
+                                                "/api/calibration/capture_tracked",
+                                            )
+                                            .send()
+                                            .await
+                                            {
+                                                Ok(resp) if resp.status() == 200 => {
+                                                    *err_cell.borrow_mut() = None;
+                                                    // Re-fetch the canonical list from the server
+                                                    // so our in-memory mirror stays in sync.
+                                                    if let Ok(r) = gloo_net::http::Request::get(
+                                                        "/api/calibration/points",
+                                                    )
+                                                    .send()
+                                                    .await
+                                                    {
+                                                        if let Ok(pts) = r
+                                                            .json::<Vec<CalibrationPoint>>()
+                                                            .await
+                                                        {
+                                                            *points_cell.borrow_mut() = Some(pts);
+                                                        }
+                                                    }
+                                                }
+                                                Ok(resp) => {
+                                                    *err_cell.borrow_mut() = Some(format!(
+                                                        "Capture failed ({})",
+                                                        resp.status()
+                                                    ));
+                                                }
+                                                Err(_) => {
+                                                    *err_cell.borrow_mut() =
+                                                        Some("Capture request failed".into());
+                                                }
+                                            }
+                                        });
+                                    }
+
+                                    if let Some(msg) = self.calib_capture_error.borrow().as_ref() {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(220, 90, 90),
+                                            msg,
+                                        );
+                                    }
+
+                                    ui.small(
+                                        "After moving, click your\nface in the video to\nre-lock tracking.",
                                     );
                                 }
-                            });
-
-                            ui.add_space(4.0);
-                            if let Some(cam) = self.calib_pending_cam {
-                                ui.label(format!(
-                                    "Cam: ({:.3}, {:.3}, {:.3})",
-                                    cam[0], cam[1], cam[2]
-                                ));
-
-                                let can_add = self.calib_world_input.iter().all(|s| {
-                                    s.trim().parse::<f32>().is_ok()
-                                });
-                                if ui
-                                    .add_enabled(can_add, egui::Button::new("Add pair"))
-                                    .clicked()
-                                {
-                                    let wx =
-                                        self.calib_world_input[0].trim().parse::<f32>().unwrap();
-                                    let wy =
-                                        self.calib_world_input[1].trim().parse::<f32>().unwrap();
-                                    let wz =
-                                        self.calib_world_input[2].trim().parse::<f32>().unwrap();
-                                    let pt = CalibrationPoint {
-                                        cam,
-                                        world: [wx, wy, wz],
-                                    };
-                                    self.calib_points.push(pt);
-                                    self.calib_pending_cam = None;
-                                    // POST to server (fire-and-forget)
-                                    wasm_bindgen_futures::spawn_local(async move {
-                                        let _ = gloo_net::http::Request::post(
-                                            "/api/calibration/points",
-                                        )
-                                        .json(&pt)
-                                        .expect("serialize CalibrationPoint")
-                                        .send()
-                                        .await;
-                                    });
-                                }
-                                if ui.small_button("Cancel").clicked() {
-                                    self.calib_pending_cam = None;
-                                }
-                            } else {
-                                ui.colored_label(
-                                    egui::Color32::from_gray(140),
-                                    "No cam point selected",
-                                );
                             }
 
                             ui.separator();
@@ -950,34 +1174,36 @@ impl eframe::App for App {
                                     .changed();
                             });
 
-                            ui.label("Rotation (°):");
                             let mut r_changed = false;
-                            ui.horizontal(|ui| {
-                                r_changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut self.manual_euler_deg[0])
-                                            .speed(0.2)
-                                            .prefix("X: ")
-                                            .fixed_decimals(1),
-                                    )
-                                    .changed();
-                                r_changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut self.manual_euler_deg[1])
-                                            .speed(0.2)
-                                            .prefix("Y: ")
-                                            .fixed_decimals(1),
-                                    )
-                                    .changed();
-                                r_changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut self.manual_euler_deg[2])
-                                            .speed(0.2)
-                                            .prefix("Z: ")
-                                            .fixed_decimals(1),
-                                    )
-                                    .changed();
-                            });
+                            if self.calib_sub_mode == CalibrationMode::PickPoint {
+                                ui.label("Rotation (°):");
+                                ui.horizontal(|ui| {
+                                    r_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut self.manual_euler_deg[0])
+                                                .speed(0.2)
+                                                .prefix("X: ")
+                                                .fixed_decimals(1),
+                                        )
+                                        .changed();
+                                    r_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut self.manual_euler_deg[1])
+                                                .speed(0.2)
+                                                .prefix("Y: ")
+                                                .fixed_decimals(1),
+                                        )
+                                        .changed();
+                                    r_changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut self.manual_euler_deg[2])
+                                                .speed(0.2)
+                                                .prefix("Z: ")
+                                                .fixed_decimals(1),
+                                        )
+                                        .changed();
+                                });
+                            }
 
                             if t_changed || r_changed {
                                 let r = euler_to_rotation(
@@ -1238,8 +1464,11 @@ impl eframe::App for App {
                         );
                     }
 
-                    // Calibration: capture a tracking point on click
-                    if self.calib_mode && response.clicked() {
+                    // Calibration: capture a tracking point on click (pick-point mode only)
+                    if self.calib_mode
+                        && self.calib_sub_mode == CalibrationMode::PickPoint
+                        && response.clicked()
+                    {
                         if let Some(pos) = response.interact_pointer_pos() {
                             for tp in &self.tracking {
                                 if let Some(p) = project(tp.x, tp.y, tp.z) {
@@ -1301,13 +1530,30 @@ impl eframe::App for App {
                                             .unwrap_or(false);
 
                                         ui.horizontal(|ui| {
-                                            // Active indicator dot
+                                            // Active indicator dot doubles as a one-click
+                                            // activate button for inactive enabled patterns.
                                             let dot_color = if is_active {
                                                 egui::Color32::from_rgb(80, 220, 100)
                                             } else {
                                                 egui::Color32::from_gray(55)
                                             };
-                                            ui.colored_label(dot_color, "●");
+                                            let dot = egui::Button::new(
+                                                egui::RichText::new("●").color(dot_color),
+                                            )
+                                            .frame(false);
+                                            let can_activate = pattern.enabled && !is_active;
+                                            let dot_resp = ui
+                                                .add_enabled(can_activate, dot)
+                                                .on_hover_text(if is_active {
+                                                    "Active"
+                                                } else if pattern.enabled {
+                                                    "Click to activate"
+                                                } else {
+                                                    "Disabled"
+                                                });
+                                            if dot_resp.clicked() {
+                                                activate_name = Some(pattern.name.clone());
+                                            }
 
                                             let text_color = if !pattern.enabled {
                                                 egui::Color32::from_gray(110)
