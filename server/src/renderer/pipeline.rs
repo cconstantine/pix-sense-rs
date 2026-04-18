@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use super::shaders;
 
-/// Frame target: ~30 fps.
-pub const FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(33);
+/// Frame target: ~60 fps.
+pub const FRAME_DURATION: std::time::Duration = std::time::Duration::from_micros(16_667);
 
 /// Strip lines from user GLSL that conflict with the prefix we prepend
 /// (version directives, precision qualifiers, and uniforms/outputs we already declare).
