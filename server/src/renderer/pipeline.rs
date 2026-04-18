@@ -9,28 +9,11 @@ use super::shaders;
 /// Frame target: ~60 fps.
 pub const FRAME_DURATION: std::time::Duration = std::time::Duration::from_micros(16_667);
 
-/// Strip lines from user GLSL that conflict with the prefix we prepend
-/// (version directives, precision qualifiers, and uniforms/outputs we already declare).
-fn sanitize_user_glsl(user_glsl: &str) -> String {
-    user_glsl
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.starts_with("#version")
-                && !trimmed.starts_with("precision ")
-                && !trimmed.starts_with("uniform float time")
-                && !trimmed.starts_with("uniform vec2 resolution")
-                && !trimmed.starts_with("uniform vec2  resolution")
-                && !trimmed.starts_with("uniform vec3 location")
-                && !trimmed.starts_with("uniform vec3  location")
-                && !trimmed.starts_with("out vec4 fragColor")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
+/// Prepend the minimal preamble (version + precision) to the user's GLSL.
+/// The user source is otherwise compiled verbatim — matches pixo's behaviour
+/// in `pixlib/src/shader.cpp`.
 fn build_pattern_frag_src(user_glsl: &str) -> String {
-    format!("{}{}", shaders::PATTERN_FRAG_PREFIX, sanitize_user_glsl(user_glsl))
+    format!("{}{}", shaders::PATTERN_FRAG_PREFIX, user_glsl)
 }
 
 /// Pattern texture dimensions.
@@ -339,11 +322,37 @@ impl RendererPipeline {
             gl.clear(glow::COLOR_BUFFER_BIT);
             gl.use_program(Some(self.pattern_program));
 
+            // Uniform set mirrors pixo's DemoPattern::render — all optional,
+            // names not declared by the user shader return loc = None and
+            // the corresponding glUniform* call is skipped.  Both native and
+            // Shadertoy-style names are supplied so pasted shaders work
+            // unmodified (note: iResolution is vec2 here, matching pixo,
+            // not Shadertoy's vec3).
+            let res_x = PATTERN_SIZE as f32;
+            let res_y = PATTERN_SIZE as f32;
+            let mouse_x = res_x * 0.5;
+            let mouse_y = res_y * 0.5;
+
             if let Some(loc) = gl.get_uniform_location(self.pattern_program, "time") {
                 gl.uniform_1_f32(Some(&loc), elapsed_secs);
             }
+            if let Some(loc) = gl.get_uniform_location(self.pattern_program, "iGlobalTime") {
+                gl.uniform_1_f32(Some(&loc), elapsed_secs);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.pattern_program, "iTime") {
+                gl.uniform_1_f32(Some(&loc), elapsed_secs);
+            }
             if let Some(loc) = gl.get_uniform_location(self.pattern_program, "resolution") {
-                gl.uniform_2_f32(Some(&loc), PATTERN_SIZE as f32, PATTERN_SIZE as f32);
+                gl.uniform_2_f32(Some(&loc), res_x, res_y);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.pattern_program, "iResolution") {
+                gl.uniform_2_f32(Some(&loc), res_x, res_y);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.pattern_program, "mouse") {
+                gl.uniform_2_f32(Some(&loc), mouse_x, mouse_y);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.pattern_program, "iMouse") {
+                gl.uniform_2_f32(Some(&loc), mouse_x, mouse_y);
             }
             if let Some(loc) = gl.get_uniform_location(self.pattern_program, "location") {
                 gl.uniform_3_f32(Some(&loc), location[0], location[1], location[2]);

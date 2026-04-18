@@ -1,25 +1,31 @@
 /// Vertex shader for Pass 1 (pattern rendering).
-/// Generates a full-screen triangle using gl_VertexID — no VBO needed.
+/// Generates a full-screen triangle via `gl_VertexID` — no VBO needed — and
+/// emits `surfacePosition` (NDC xy) so user shaders written for pixo's
+/// environment can read it directly.
 pub const PATTERN_VERT: &str = r#"#version 300 es
-// Full-screen triangle: vertices are computed from gl_VertexID so no VBO is needed.
 const vec2 POSITIONS[3] = vec2[3](
     vec2(-1.0, -1.0),
     vec2( 3.0, -1.0),
     vec2(-1.0,  3.0)
 );
+out vec2 surfacePosition;
 void main() {
-    gl_Position = vec4(POSITIONS[gl_VertexID], 0.0, 1.0);
+    vec2 p = POSITIONS[gl_VertexID];
+    surfacePosition = p;
+    gl_Position = vec4(p, 0.0, 1.0);
 }
 "#;
 
-/// Prefix injected before user GLSL code for Pass 1 fragment shader.
-/// The user's code must write to `fragColor`.
+/// Preamble prepended to user fragment GLSL.  Matches pixo's minimal
+/// environment: just sets the GLSL ES version and a default float precision.
+/// The user's shader is otherwise compiled verbatim — it declares its own
+/// `out vec4` and any `uniform`s it uses, and names the uniforms directly
+/// (e.g. `time`, `resolution`, `iGlobalTime`, `iResolution`, `location`).
+/// See `RendererPipeline::render_pattern` for the full set of uniforms the
+/// renderer attempts to set; any the shader doesn't declare are silently
+/// skipped because `glGetUniformLocation` returns -1.
 pub const PATTERN_FRAG_PREFIX: &str = r#"#version 300 es
 precision highp float;
-uniform float time;       // seconds since renderer start
-uniform vec2  resolution; // texture dimensions (512.0, 512.0)
-uniform vec3  location;   // tracked person world position (metres)
-out vec4 fragColor;
 "#;
 
 /// Vertex shader for Pass 2 (LED projection).
