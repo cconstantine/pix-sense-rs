@@ -568,11 +568,14 @@ fn build_view_proj(
 /// `IsoCamera::get_zoom`.  `scope` is the LED-cloud half-extents; `dist` is the
 /// eye→centroid distance.  Falls back to 90° when the geometry is degenerate
 /// (e.g. viewpoint inside the LED cloud).
+///
+/// The FOV must scale freely with distance to keep the LEDs framed in the
+/// frustum — that's what holds the projected image at a constant size on the
+/// LEDs.  No MIN/MAX clamp here: pixo doesn't have one, and clamping breaks
+/// the constant-framing property at the clamp boundary (the image grows as the
+/// viewer moves away once FOV is pinned).
 fn compute_fov(scope: [f32; 3], dist: f32, overscan: bool) -> f32 {
-    const MIN_FOV: f32 = 10.0 * std::f32::consts::PI / 180.0;
-    const MAX_FOV: f32 = 170.0 * std::f32::consts::PI / 180.0;
-
-    let fov = if overscan {
+    if overscan {
         let radius = (scope[0] * scope[0] + scope[1] * scope[1] + scope[2] * scope[2]).sqrt();
         if dist <= 1e-6 {
             return FRAC_PI_2;
@@ -585,9 +588,7 @@ fn compute_fov(scope: [f32; 3], dist: f32, overscan: bool) -> f32 {
             return FRAC_PI_2;
         }
         2.0 * ((edge * 0.5) / position_distance).atan()
-    };
-
-    fov.clamp(MIN_FOV, MAX_FOV)
+    }
 }
 
 fn check_fbo(gl: &glow::Context) -> Result<()> {
