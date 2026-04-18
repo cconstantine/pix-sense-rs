@@ -47,10 +47,10 @@ fn run_inner(
         .build()?;
 
     // --- Load initial data from DB ---
-    let (leds_by_device, initial_glsl, brightness, gamma) = rt.block_on(async {
+    let (leds_by_device, initial_glsl, brightness, gamma, overscan) = rt.block_on(async {
         let leds_by_device = db::load_leds(pool).await;
 
-        let (glsl, brightness, gamma) = db::load_active_pattern(pool, sculpture_name)
+        let (glsl, brightness, gamma, overscan) = db::load_active_pattern(pool, sculpture_name)
             .await
             .unwrap_or_else(|| {
                 tracing::warn!(
@@ -61,6 +61,7 @@ fn run_inner(
                     "void main() { fragColor = vec4(0.0, 0.0, 0.0, 1.0); }".to_string(),
                     1.0f32,
                     2.2f32,
+                    true,
                 )
             });
 
@@ -70,7 +71,7 @@ fn run_inner(
             leds_by_device.iter().map(|(_, l)| l.len()).sum::<usize>(),
         );
 
-        anyhow::Ok((leds_by_device, glsl, brightness, gamma))
+        anyhow::Ok((leds_by_device, glsl, brightness, gamma, overscan))
     })?;
 
     // Flatten all LEDs into one list for the VBO (order: device0 leds, device1 leds, …).
@@ -82,8 +83,9 @@ fn run_inner(
     // --- Shared state for hot-reload ---
     let reload_flag = Arc::new(AtomicBool::new(false));
     let new_glsl: Arc<Mutex<String>> = Arc::new(Mutex::new(initial_glsl.clone()));
-    let new_brightness_gamma: Arc<Mutex<(f32, f32)>> =
-        Arc::new(Mutex::new((brightness, gamma)));
+    // (brightness, gamma, overscan)
+    let new_render_settings: Arc<Mutex<(f32, f32, bool)>> =
+        Arc::new(Mutex::new((brightness, gamma, overscan)));
 
     // --- Spawn settings watcher task (async, on the local rt) ---
     {
@@ -91,11 +93,11 @@ fn run_inner(
         let sn = sculpture_name.to_string();
         let flag = reload_flag.clone();
         let glsl_shared = new_glsl.clone();
-        let bg_shared = new_brightness_gamma.clone();
+        let settings_shared = new_render_settings.clone();
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
 
         rt.spawn(async move {
-            settings_watcher(pool, sn, db_url, flag, glsl_shared, bg_shared).await;
+            settings_watcher(pool, sn, db_url, flag, glsl_shared, settings_shared).await;
         });
     }
 
@@ -118,6 +120,7 @@ fn run_inner(
     let mut pipe = RendererPipeline::new(gl, &all_leds, &initial_glsl)?;
     let mut current_brightness = brightness;
     let mut current_gamma = gamma;
+    let mut current_overscan = overscan;
 
     tracing::info!("Renderer: GL pipeline initialised — entering frame loop");
 
@@ -132,10 +135,11 @@ fn run_inner(
         // Check for shader/settings hot-reload.
         if reload_flag.swap(false, Ordering::AcqRel) {
             let glsl = new_glsl.lock().unwrap().clone();
-            let (b, g) = *new_brightness_gamma.lock().unwrap();
+            let (b, g, o) = *new_render_settings.lock().unwrap();
             pipe.reload_pattern_shader(gl, &glsl);
             current_brightness = b;
             current_gamma = g;
+            current_overscan = o;
         }
 
         // Get latest tracked person position.
@@ -145,7 +149,7 @@ fn run_inner(
         pipe.render_pattern(gl, location.unwrap_or([0.0, 0.0, 0.0]));
 
         // Pass 2: project LED positions onto pattern.
-        pipe.render_leds(gl, location);
+        pipe.render_leds(gl, location, current_overscan);
 
         // PBO readback (returns previous frame's data — 1-frame latency).
         if let Some(rgba) = pipe.pbo_readback(gl) {
@@ -205,7 +209,7 @@ async fn settings_watcher(
     db_url: String,
     reload_flag: Arc<AtomicBool>,
     new_glsl: Arc<Mutex<String>>,
-    new_bg: Arc<Mutex<(f32, f32)>>,
+    new_settings: Arc<Mutex<(f32, f32, bool)>>,
 ) {
     if db_url.is_empty() {
         return;
@@ -229,11 +233,11 @@ async fn settings_watcher(
     loop {
         match listener.recv().await {
             Ok(_) => {
-                if let Some((glsl, b, g)) =
+                if let Some((glsl, b, g, o)) =
                     db::load_active_pattern(&pool, &sculpture_name).await
                 {
                     *new_glsl.lock().unwrap() = glsl;
-                    *new_bg.lock().unwrap() = (b, g);
+                    *new_settings.lock().unwrap() = (b, g, o);
                     reload_flag.store(true, Ordering::Release);
                     tracing::info!("settings_watcher: pattern/settings change detected — flagging reload");
                 }

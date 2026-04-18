@@ -194,13 +194,14 @@ pub async fn load_leds(pool: &PgPool) -> Vec<(String, Vec<[f32; 3]>)> {
 }
 
 /// Load the active pattern GLSL code and display settings for the named sculpture.
-/// Returns `(glsl_code, brightness, gamma)` or `None` if no enabled active pattern is found.
+/// Returns `(glsl_code, brightness, gamma, overscan)` or `None` if no enabled
+/// active pattern is found.
 pub async fn load_active_pattern(
     pool: &PgPool,
     sculpture_name: &str,
-) -> Option<(String, f32, f32)> {
+) -> Option<(String, f32, f32, bool)> {
     let row = sqlx::query(
-        "SELECT p.glsl_code, s.brightness, s.gamma \
+        "SELECT p.glsl_code, p.overscan, s.brightness, s.gamma \
          FROM sculpture_settings s \
          JOIN patterns p ON p.name = s.active_pattern \
          WHERE s.name = $1 AND p.enabled = true",
@@ -210,7 +211,12 @@ pub async fn load_active_pattern(
     .await
     .ok()??;
 
-    Some((row.get("glsl_code"), row.get("brightness"), row.get("gamma")))
+    Some((
+        row.get("glsl_code"),
+        row.get("brightness"),
+        row.get("gamma"),
+        row.get("overscan"),
+    ))
 }
 
 /// Load the persisted detection config, or return `None` if the row is missing.

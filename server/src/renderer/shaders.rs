@@ -41,11 +41,16 @@ void main() {
     // Project LED world position to clip space via the person's view frustum.
     vec4 clip = view_proj * vec4(led_world_pos, 1.0);
 
-    // Map NDC [-1,1] → UV [0,1].  Clamp to avoid sampling outside the pattern.
-    vec2 uv = clamp(clip.xy / clip.w * 0.5 + 0.5, 0.0, 1.0);
+    // Map NDC [-1,1] → UV [0,1].
+    vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
 
-    // Sample the pattern texture at this LED's projected UV.
-    led_color = texture(pattern_tex, uv);
+    // Only LEDs inside the pattern frustum sample the pattern; those outside
+    // go black.  In overscan mode the frustum contains every LED (all sample);
+    // in standard mode the outermost LEDs fall outside and remain dark.
+    bool inside = clip.w > 0.0
+               && all(greaterThanEqual(uv, vec2(0.0)))
+               && all(lessThanEqual   (uv, vec2(1.0)));
+    led_color = inside ? texture(pattern_tex, uv) : vec4(0.0, 0.0, 0.0, 1.0);
 
     // Compute the pixel column and row for this LED in the output canvas.
     float col = mod(led_index, canvas_size.x);

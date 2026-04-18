@@ -134,6 +134,7 @@ pub struct RendererPipeline {
     canvas_w:         u32,
     canvas_h:         u32,
     led_centroid:     [f32; 3],
+    led_scope:        [f32; 3],
     start_time:       Instant,
 }
 
@@ -150,15 +151,30 @@ impl RendererPipeline {
         let (canvas_w, canvas_h) = compute_canvas_size(num_leds);
         let pbo_size = (canvas_w * canvas_h * 4) as usize;
 
-        // Compute LED centroid for view matrix construction.
-        let led_centroid = if num_leds > 0 {
-            let sum = all_leds.iter().fold([0f32; 3], |acc, p| {
-                [acc[0] + p[0], acc[1] + p[1], acc[2] + p[2]]
-            });
-            let n = num_leds as f32;
-            [sum[0] / n, sum[1] / n, sum[2] / n]
+        // Compute LED centroid and bounding half-extents for view/projection construction.
+        let (led_centroid, led_scope) = if num_leds > 0 {
+            let (min, max) = all_leds.iter().fold(
+                ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+                |(mn, mx), p| {
+                    (
+                        [mn[0].min(p[0]), mn[1].min(p[1]), mn[2].min(p[2])],
+                        [mx[0].max(p[0]), mx[1].max(p[1]), mx[2].max(p[2])],
+                    )
+                },
+            );
+            let centroid = [
+                (min[0] + max[0]) * 0.5,
+                (min[1] + max[1]) * 0.5,
+                (min[2] + max[2]) * 0.5,
+            ];
+            let scope = [
+                (max[0] - min[0]) * 0.5,
+                (max[1] - min[1]) * 0.5,
+                (max[2] - min[2]) * 0.5,
+            ];
+            (centroid, scope)
         } else {
-            [0.0, 0.0, 1.0]
+            ([0.0, 0.0, 1.0], [1.0, 1.0, 1.0])
         };
 
         unsafe {
@@ -305,6 +321,7 @@ impl RendererPipeline {
                 canvas_w,
                 canvas_h,
                 led_centroid,
+                led_scope,
                 start_time: Instant::now(),
             })
         }
@@ -343,12 +360,17 @@ impl RendererPipeline {
     // -----------------------------------------------------------------------
     // Pass 2: project LED positions onto pattern texture, output one px/LED
     // -----------------------------------------------------------------------
-    pub fn render_leds(&self, gl: &glow::Context, person_pos: Option<[f32; 3]>) {
+    pub fn render_leds(
+        &self,
+        gl: &glow::Context,
+        person_pos: Option<[f32; 3]>,
+        overscan: bool,
+    ) {
         if self.num_leds == 0 {
             return;
         }
 
-        let vp = build_view_proj(person_pos, self.led_centroid);
+        let vp = build_view_proj(person_pos, self.led_centroid, self.led_scope, overscan);
 
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.led_output_fbo));
@@ -493,7 +515,19 @@ fn apply_brightness_gamma(v: u8, brightness: f32, gamma: f32) -> u8 {
 
 /// Build a perspective view-projection matrix from `person_pos` looking toward
 /// the LED centroid.  Returns a column-major `[f32; 16]` for OpenGL.
-fn build_view_proj(person_pos: Option<[f32; 3]>, centroid: [f32; 3]) -> [f32; 16] {
+///
+/// FOV is picked from the LED bounding-box half-extents `scope`:
+///   overscan = true  → frustum contains the LED bounding sphere (every LED
+///                      lands inside the pattern, minimal wasted pattern).
+///   overscan = false → frustum fits inside the LED cloud (every pixel of the
+///                      pattern lands on at least one LED; outer LEDs go black).
+/// Mirrors pixo's `IsoCamera::get_zoom` (pixlib/src/camera.cpp).
+fn build_view_proj(
+    person_pos: Option<[f32; 3]>,
+    centroid: [f32; 3],
+    scope: [f32; 3],
+    overscan: bool,
+) -> [f32; 16] {
     let eye = match person_pos {
         Some(p) => Point3::new(p[0], p[1], p[2]),
         None => Point3::new(
@@ -507,24 +541,53 @@ fn build_view_proj(person_pos: Option<[f32; 3]>, centroid: [f32; 3]) -> [f32; 16
 
     // Avoid degenerate view matrix when eye == target.
     let look_dir = target - eye;
-    if look_dir.norm_squared() < 1e-6 {
+    let dist = look_dir.norm();
+    if dist < 1e-6 {
         return Matrix4::identity().as_slice().try_into().unwrap();
     }
 
     // Choose up vector; if looking straight up/down, use Z instead.
-    let up = if look_dir.y.abs() > 0.99 * look_dir.norm() {
+    let up = if look_dir.y.abs() > 0.99 * dist {
         Vector3::z()
     } else {
         Vector3::y()
     };
 
+    let fov = compute_fov(scope, dist, overscan);
+
     let view = Matrix4::look_at_rh(&eye, &target, &up);
-    let proj = Matrix4::new_perspective(1.0, FRAC_PI_2, 0.01, 100.0);
+    let proj = Matrix4::new_perspective(1.0, fov, 0.01, 100.0);
     let vp = proj * view;
 
     // nalgebra stores column-major — convert to [f32; 16].
     let s = vp.as_slice();
     s.try_into().unwrap()
+}
+
+/// Vertical FOV (radians) for the LED-projection perspective.  Ports pixo's
+/// `IsoCamera::get_zoom`.  `scope` is the LED-cloud half-extents; `dist` is the
+/// eye→centroid distance.  Falls back to 90° when the geometry is degenerate
+/// (e.g. viewpoint inside the LED cloud).
+fn compute_fov(scope: [f32; 3], dist: f32, overscan: bool) -> f32 {
+    const MIN_FOV: f32 = 10.0 * std::f32::consts::PI / 180.0;
+    const MAX_FOV: f32 = 170.0 * std::f32::consts::PI / 180.0;
+
+    let fov = if overscan {
+        let radius = (scope[0] * scope[0] + scope[1] * scope[1] + scope[2] * scope[2]).sqrt();
+        if dist <= 1e-6 {
+            return FRAC_PI_2;
+        }
+        2.0 * (radius / dist).atan()
+    } else {
+        let edge = 2.0 * (scope[0] + scope[1] + scope[2]) / 3.0;
+        let position_distance = dist - edge / 3.0;
+        if position_distance <= 1e-6 {
+            return FRAC_PI_2;
+        }
+        2.0 * ((edge * 0.5) / position_distance).atan()
+    };
+
+    fov.clamp(MIN_FOV, MAX_FOV)
 }
 
 fn check_fbo(gl: &glow::Context) -> Result<()> {
