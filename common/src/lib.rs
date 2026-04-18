@@ -124,6 +124,14 @@ pub enum ClientMessage {
     /// Lock person tracking onto the person at this camera-frame XYZ.
     /// The server applies extrinsics to get the world-frame target.
     SelectPerson { xyz: [f32; 3] },
+    /// Drive the LED renderer from a simulated world-frame location.
+    /// `Some(xyz)` sets/updates the override; `None` clears it and lets the
+    /// real DB-driven tracking resume.
+    VirtualLocation { xyz: Option<[f32; 3]> },
+    /// Enable or disable tracking updates to the renderer. When `false`, the
+    /// server stops pushing new positions (from DB or virtual) to the renderer's
+    /// watch channel, so the LEDs hold whatever state was last sent.
+    TrackingEnabled(bool),
 }
 
 /// Camera extrinsic transform: p_world = R * p_cam + t

@@ -206,7 +206,6 @@ struct AppState {
     db_pool: Option<PgPool>,
     tracking_tx: broadcast::Sender<String>,
     /// Latest tracked person world position forwarded to the GL renderer.
-    #[allow(dead_code)] // kept in AppState to own the sender; all reads go through tracking_listener
     tracking_pos_tx: watch::Sender<Option<[f32; 3]>>,
     /// Latest LED color frame from the renderer, pre-serialised as JSON for WebSocket broadcast.
     led_colors_rx: watch::Receiver<Option<String>>,
@@ -215,6 +214,13 @@ struct AppState {
     /// Pending manual person-selection target (world frame). Drained by the processing
     /// thread once per frame to override `PersonSelector`'s automatic pick.
     pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
+    /// Virtual tracking override: when `Some`, the LED renderer is driven by this
+    /// world-frame XYZ instead of the DB-streamed real tracking.
+    virtual_override: Arc<RwLock<Option<[f32; 3]>>>,
+    /// When `false`, suppresses pushes to `tracking_pos_tx` so the renderer
+    /// holds its last value — lets the operator freeze the LED state and
+    /// orbit the scene camera to inspect from other angles.
+    tracking_enabled: Arc<AtomicBool>,
     /// Calibration point pairs collected in this session (in-memory, not persisted).
     calib_points: Arc<Mutex<Vec<CalibrationPoint>>>,
     /// Latest (cam-frame, world-frame) XYZ pair of the currently-tracked person.
@@ -303,6 +309,14 @@ async fn main() -> Result<()> {
 
     let pending_selection: Arc<Mutex<Option<[f32; 3]>>> = Arc::new(Mutex::new(None));
 
+    // Virtual tracking override — set via `ClientMessage::VirtualLocation` and drained
+    // by `tracking_listener` when deciding the renderer's input position.
+    let virtual_override: Arc<RwLock<Option<[f32; 3]>>> = Arc::new(RwLock::new(None));
+
+    // Toggled by `ClientMessage::TrackingEnabled`. False = freeze — the DB
+    // listener and virtual handler both stop writing to `tracking_pos_tx`.
+    let tracking_enabled: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
+
     let metrics = Arc::new(Metrics::new());
 
     // Watch channel for the currently-tracked person's (cam-frame, world-frame) XYZ
@@ -357,8 +371,10 @@ async fn main() -> Result<()> {
         let pool = pool.clone();
         let ws_tx = tracking_tx.clone();
         let pos_tx = tracking_pos_tx.clone();
+        let virt = virtual_override.clone();
+        let enabled = tracking_enabled.clone();
         tokio::spawn(async move {
-            tracking_listener(pool, ws_tx, pos_tx).await;
+            tracking_listener(pool, ws_tx, pos_tx, virt, enabled).await;
         });
     }
 
@@ -388,6 +404,8 @@ async fn main() -> Result<()> {
         led_colors_rx,
         extrinsics,
         pending_selection,
+        virtual_override,
+        tracking_enabled,
         calib_points,
         tracked_pair_rx,
         camera_id,
@@ -465,6 +483,9 @@ async fn ws_handler(
             state.db_pool,
             state.extrinsics,
             state.pending_selection,
+            state.virtual_override,
+            state.tracking_enabled,
+            state.tracking_pos_tx,
         )
     })
 }
@@ -478,6 +499,9 @@ async fn handle_ws(
     db_pool: Option<PgPool>,
     extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
     pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
+    virtual_override: Arc<RwLock<Option<[f32; 3]>>>,
+    tracking_enabled: Arc<AtomicBool>,
+    tracking_pos_tx: watch::Sender<Option<[f32; 3]>>,
 ) {
     // Send the current detection config immediately so the client UI reflects
     // the persisted setting rather than its hard-coded default.
@@ -559,6 +583,27 @@ async fn handle_ws(
                                     xyz, world
                                 );
                             }
+                            Ok(ClientMessage::VirtualLocation { xyz }) => {
+                                // Swap the override; only push to the renderer if the
+                                // state actually changed. This prevents a client sending
+                                // a redundant `None` (e.g. when leaving Frozen without a
+                                // prior virtual override set) from blanking the renderer.
+                                let prev = {
+                                    let mut g = virtual_override.write().unwrap();
+                                    let prev = *g;
+                                    *g = xyz;
+                                    prev
+                                };
+                                if prev != xyz && tracking_enabled.load(Ordering::Relaxed) {
+                                    let _ = tracking_pos_tx.send(xyz);
+                                }
+                            }
+                            Ok(ClientMessage::TrackingEnabled(enabled)) => {
+                                tracking_enabled.store(enabled, Ordering::Relaxed);
+                                // Intentionally don't push on re-enable: the next DB
+                                // NOTIFY (or the next VirtualLocation message) will
+                                // refresh the renderer's input within a frame or two.
+                            }
                             Err(e) => {
                                 tracing::warn!("Unrecognised client message: {e}");
                             }
@@ -580,6 +625,8 @@ async fn tracking_listener(
     pool: PgPool,
     ws_tx: broadcast::Sender<String>,
     pos_tx: watch::Sender<Option<[f32; 3]>>,
+    virtual_override: Arc<RwLock<Option<[f32; 3]>>>,
+    tracking_enabled: Arc<AtomicBool>,
 ) {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         tracing::warn!("DATABASE_URL not set, tracking_listener exiting");
@@ -620,8 +667,15 @@ async fn tracking_listener(
                     .collect();
 
                 // Update renderer with the first tracked position (primary person).
-                let renderer_pos = points.first().map(|p| [p.x, p.y, p.z]);
-                let _ = pos_tx.send(renderer_pos);
+                // Virtual override wins when set — the client is driving a simulated
+                // location through the UI and we want the LEDs to react to that.
+                // When tracking is disabled, skip the push so the renderer holds
+                // its last value — lets the operator freeze-frame the LEDs.
+                if tracking_enabled.load(Ordering::Relaxed) {
+                    let renderer_pos = points.first().map(|p| [p.x, p.y, p.z]);
+                    let effective = virtual_override.read().unwrap().or(renderer_pos);
+                    let _ = pos_tx.send(effective);
+                }
 
                 if let Ok(json) =
                     serde_json::to_string(&ServerMessage::Tracking(points))

@@ -1,4 +1,5 @@
 mod overlay;
+mod scene3d;
 
 use eframe::egui;
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
@@ -7,8 +8,10 @@ use pix_sense_common::{
     DetectionConfig, FaceDetection, LedPoint, Pattern, PatternUpdate, SculptureSettings,
     ServerMessage, StreamSelection, TrackingPoint,
 };
+use scene3d::SceneRenderer;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -58,6 +61,30 @@ void main() {\n\
     vec2 uv = gl_FragCoord.xy / resolution;\n\
     fragColor = vec4(uv, 0.5 + 0.5 * sin(time * 0.001), 1.0);\n\
 }\n";
+
+/// What drives the 3D scene's orbit camera.
+#[derive(Clone, PartialEq)]
+enum SceneLock {
+    /// User-controlled orbit (drag = rotate, scroll = zoom).
+    Free,
+    /// Camera orbits around the named tracked person's world position.
+    Tracked(String),
+}
+
+/// Where the LED renderer's tracking location comes from. Orthogonal to
+/// `SceneLock` — the scene camera and the tracking source are independent.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TrackingSource {
+    /// Server pushes real person detections from the depth camera (default).
+    DepthCamera,
+    /// Server uses the scene camera's orbit eye position as the tracking
+    /// location. The client streams `VirtualLocation` updates each frame.
+    SceneCamera,
+    /// Server stops pushing new tracking positions to the renderer, so the
+    /// LEDs hold whatever state was last sent. Useful for inspecting the
+    /// sculpture from other angles without the LEDs updating.
+    Frozen,
+}
 
 /// Which capture workflow is active inside the calibration side panel.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -121,7 +148,13 @@ struct App {
     show_cameras: bool,
     show_scene: bool,
     show_patterns: bool,
-    locked_location: Option<String>,
+    /// Which viewpoint the 3D scene's orbit camera is driven by.
+    scene_lock: SceneLock,
+    /// Where the LED renderer's tracking location comes from.
+    tracking_source: TrackingSource,
+    /// Throttle timestamp for `send_virtual_location` (egui `ctx.input.time`).
+    /// Used while `tracking_source == SceneCamera` to rate-limit WS updates.
+    last_virtual_send: f64,
     // Calibration state
     calib_mode: bool,
     /// Which capture workflow is active within calibration mode.
@@ -158,6 +191,8 @@ struct App {
     // while the slider is being dragged; server debounces via its DB NOTIFY path.
     settings: SculptureSettings,
     settings_pending: Rc<RefCell<Option<SculptureSettings>>>,
+    /// GL-backed renderer for LED cubes (depth-tested). None if glow init failed.
+    scene_renderer: Option<Arc<Mutex<SceneRenderer>>>,
 }
 
 struct FpsCounter {
@@ -195,7 +230,7 @@ impl FpsCounter {
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ws_url = get_ws_url();
         let (ws_sender, ws_receiver) =
             ewebsock::connect(&ws_url, ewebsock::Options::default())
@@ -324,7 +359,9 @@ impl App {
             show_cameras: true,
             show_scene: true,
             show_patterns: true,
-            locked_location: None,
+            scene_lock: SceneLock::Free,
+            tracking_source: TrackingSource::DepthCamera,
+            last_virtual_send: 0.0,
             calib_mode: false,
             calib_sub_mode: CalibrationMode::PickPoint,
             calib_points: Vec::new(),
@@ -346,6 +383,15 @@ impl App {
             pattern_new_name: String::new(),
             settings: SculptureSettings { brightness: 1.0, gamma: 2.2 },
             settings_pending,
+            scene_renderer: cc.gl.as_ref().and_then(|gl| {
+                match SceneRenderer::new(gl) {
+                    Ok(r) => Some(Arc::new(Mutex::new(r))),
+                    Err(e) => {
+                        tracing::error!("scene3d init failed: {e}");
+                        None
+                    }
+                }
+            }),
         }
     }
 
@@ -405,6 +451,24 @@ impl App {
     /// Tell the server to lock tracking onto the given camera-frame XYZ.
     fn send_select_person(&mut self, xyz: [f32; 3]) {
         let msg = ClientMessage::SelectPerson { xyz };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            self.ws_sender.send(WsMessage::Text(json));
+        }
+    }
+
+    /// Set (Some) or clear (None) the server-side virtual tracking override.
+    /// Sent on mode-transition and throttled while dragging in Virtual mode.
+    fn send_virtual_location(&mut self, xyz: Option<[f32; 3]>) {
+        let msg = ClientMessage::VirtualLocation { xyz };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            self.ws_sender.send(WsMessage::Text(json));
+        }
+    }
+
+    /// Enable or disable server-side tracking updates to the renderer.
+    /// `false` freezes the LED state so the operator can inspect from other angles.
+    fn send_tracking_enabled(&mut self, enabled: bool) {
+        let msg = ClientMessage::TrackingEnabled(enabled);
         if let Ok(json) = serde_json::to_string(&msg) {
             self.ws_sender.send(WsMessage::Text(json));
         }
@@ -507,6 +571,14 @@ fn decode_jpeg_gray(jpeg_data: &[u8]) -> Option<egui::ColorImage> {
 
 
 impl eframe::App for App {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let (Some(gl), Some(r)) = (gl, self.scene_renderer.as_ref()) {
+            if let Ok(r) = r.lock() {
+                r.destroy(gl);
+            }
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain LED fetch result (arrives once after startup)
         if let Some(leds) = self.led_pending.borrow_mut().take() {
@@ -864,6 +936,13 @@ impl eframe::App for App {
         }
 
         // ── 3D Scene window ───────────────────────────────────────
+        // Virtual-location and tracking-enabled sends happen after the Window
+        // closure returns so the `&mut self.show_scene` borrow taken by `.open(...)`
+        // doesn't conflict with the `&mut self` the helpers need.
+        // Outer option = "has a send"; inner option = Some(xyz) to set, None to clear.
+        let mut pending_virtual_send: Option<Option<[f32; 3]>> = None;
+        let mut pending_tracking_enabled: Option<bool> = None;
+
         egui::Window::new("3D Scene")
             .default_size([600.0, 500.0])
             .default_pos([660.0, 80.0])
@@ -883,29 +962,84 @@ impl eframe::App for App {
                             };
                             ui.small(format!("Camera: {}", cam_label));
 
-                            // Location lock
-                            if !self.tracking.is_empty() {
-                                ui.separator();
-                                ui.label("Lock to:");
-                                let selected_label = match &self.locked_location {
-                                    Some(name) => name.chars().take(8).collect::<String>(),
-                                    None => "Free".to_string(),
-                                };
-                                egui::ComboBox::from_id_salt("location_lock")
-                                    .selected_text(selected_label)
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut self.locked_location, None, "Free");
-                                        let names: Vec<String> =
-                                            self.tracking.iter().map(|p| p.name.clone()).collect();
-                                        for name in names {
-                                            let label = name.chars().take(8).collect::<String>();
-                                            ui.selectable_value(
-                                                &mut self.locked_location,
-                                                Some(name.clone()),
-                                                label,
-                                            );
-                                        }
-                                    });
+                            // Scene camera driver — free orbit or a specific tracked person.
+                            ui.separator();
+                            ui.label("Lock to:");
+                            let selected_label = match &self.scene_lock {
+                                SceneLock::Free => "Free".to_string(),
+                                SceneLock::Tracked(name) => {
+                                    name.chars().take(8).collect::<String>()
+                                }
+                            };
+                            egui::ComboBox::from_id_salt("location_lock")
+                                .selected_text(selected_label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.scene_lock,
+                                        SceneLock::Free,
+                                        "Free",
+                                    );
+                                    let names: Vec<String> =
+                                        self.tracking.iter().map(|p| p.name.clone()).collect();
+                                    for name in names {
+                                        let label = name.chars().take(8).collect::<String>();
+                                        ui.selectable_value(
+                                            &mut self.scene_lock,
+                                            SceneLock::Tracked(name.clone()),
+                                            label,
+                                        );
+                                    }
+                                });
+
+                            // Tracking source — independent of the scene camera.
+                            // Controls what the LED renderer's `location` uniform follows.
+                            ui.add_space(4.0);
+                            ui.label("Tracking source:");
+                            let prev_source = self.tracking_source;
+                            egui::ComboBox::from_id_salt("tracking_source")
+                                .selected_text(match self.tracking_source {
+                                    TrackingSource::DepthCamera => "Depth camera",
+                                    TrackingSource::SceneCamera => "Scene camera",
+                                    TrackingSource::Frozen => "Frozen",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.tracking_source,
+                                        TrackingSource::DepthCamera,
+                                        "Depth camera",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.tracking_source,
+                                        TrackingSource::SceneCamera,
+                                        "Scene camera",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.tracking_source,
+                                        TrackingSource::Frozen,
+                                        "Frozen",
+                                    );
+                                });
+                            // Transition side-effects on the server's tracking inputs:
+                            //   * Entering Frozen  → TrackingEnabled(false)
+                            //   * Leaving  Frozen  → TrackingEnabled(true)
+                            //   * Leaving  SceneCamera to DepthCamera → clear virtual override
+                            //   * SceneCamera → Frozen deliberately keeps the override
+                            //     so the last streamed position stays the frozen state.
+                            if prev_source != self.tracking_source {
+                                match (prev_source, self.tracking_source) {
+                                    (_, TrackingSource::Frozen) => {
+                                        pending_tracking_enabled = Some(false);
+                                    }
+                                    (TrackingSource::Frozen, _) => {
+                                        pending_tracking_enabled = Some(true);
+                                    }
+                                    _ => {}
+                                }
+                                if prev_source == TrackingSource::SceneCamera
+                                    && self.tracking_source == TrackingSource::DepthCamera
+                                {
+                                    pending_virtual_send = Some(None);
+                                }
                             }
 
                             ui.separator();
@@ -1226,21 +1360,20 @@ impl eframe::App for App {
                         });
 
                     // ── 3D scatter view ────────────────────────────────────────
-                    // Apply locked-location camera before handling user input
-                    let is_locked = if let Some(ref locked_name) = self.locked_location.clone() {
-                        if let Some(pt) =
-                            self.tracking.iter().find(|p| &p.name == locked_name)
+                    // Tracked mode auto-follows the person; Free and Virtual
+                    // use the same orbit controls (drag = rotate, scroll = zoom).
+                    // Virtual additionally streams the orbit eye position to the
+                    // server as a virtual tracking location (handled below).
+                    let is_locked = if let SceneLock::Tracked(locked_name) = &self.scene_lock {
+                        if let Some(pt) = self.tracking.iter().find(|p| &p.name == locked_name)
                         {
                             let dx = pt.x;
                             let dy = pt.y;
                             let dz = pt.z;
-                            // Orbit eye = Zoom·(cos(yaw)cos(pitch), sin(pitch), sin(yaw)cos(pitch)).
-                            // Inverting for eye = (dx, dy, dz): yaw = atan2(dz, dx), pitch = atan2(dy, r_xz).
                             let r_xz = (dx * dx + dz * dz).sqrt();
                             self.scene_yaw = dz.atan2(dx);
                             self.scene_pitch = dy.atan2(r_xz);
-                            self.scene_zoom =
-                                (dx * dx + dy * dy + dz * dz).sqrt().max(0.5);
+                            self.scene_zoom = (dx * dx + dy * dy + dz * dz).sqrt().max(0.5);
                             true
                         } else {
                             false
@@ -1260,18 +1393,15 @@ impl eframe::App for App {
                         sense,
                     );
 
-                    // Orbit on drag (free mode only)
                     if !is_locked && response.dragged() {
                         let d = response.drag_delta();
                         self.scene_yaw += d.x * 0.005;
                         self.scene_pitch =
                             (self.scene_pitch + d.y * 0.005).clamp(-1.5, 1.5);
                     }
-                    // Zoom on scroll (free mode only)
                     if !is_locked && response.hovered() {
                         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                        self.scene_zoom =
-                            (self.scene_zoom - scroll * 0.01).clamp(0.5, 20.0);
+                        self.scene_zoom = (self.scene_zoom - scroll * 0.01).clamp(0.5, 20.0);
                     }
 
                     let painter = ui.painter_at(rect);
@@ -1282,7 +1412,17 @@ impl eframe::App for App {
                     } else if is_locked {
                         "3D View  (locked to location)"
                     } else {
-                        "3D View  (drag = orbit  |  scroll = zoom)"
+                        match self.tracking_source {
+                            TrackingSource::SceneCamera => {
+                                "3D View  (drag = orbit  |  scroll = zoom  |  tracking → scene camera)"
+                            }
+                            TrackingSource::Frozen => {
+                                "3D View  (drag = orbit  |  scroll = zoom  |  tracking frozen)"
+                            }
+                            TrackingSource::DepthCamera => {
+                                "3D View  (drag = orbit  |  scroll = zoom)"
+                            }
+                        }
                     };
                     painter.text(
                         rect.left_top() + egui::vec2(6.0, 4.0),
@@ -1303,6 +1443,18 @@ impl eframe::App for App {
                     let (cp, sp) = (pitch.cos(), pitch.sin());
                     let (cyw, sy) = (yaw.cos(), yaw.sin());
                     let eye = [dist * cyw * cp, dist * sp, dist * sy * cp];
+
+                    // Scene-camera tracking: stream the orbit eye as the tracking
+                    // location so the LED renderer reacts as if a person were here.
+                    // Throttled to ~30 Hz to match the drag/orbit update cadence.
+                    if self.tracking_source == TrackingSource::SceneCamera {
+                        let now = ctx.input(|i| i.time);
+                        if now - self.last_virtual_send > 0.03 {
+                            pending_virtual_send = Some(Some(eye));
+                            self.last_virtual_send = now;
+                        }
+                    }
+
                     let fwd = [-cyw * cp, -sp, -sy * cp]; // unit vector from eye to origin
                     // right = normalize(fwd × WorldUp(0,1,0)) = normalize((-fwd.z, 0, fwd.x));
                     // up = right × fwd.
@@ -1328,30 +1480,65 @@ impl eframe::App for App {
                         Some(egui::pos2(cx + scale * vx / vz, cy - scale * vy / vz))
                     };
 
-                    // LEDs — colored when renderer is active, dim gray otherwise
-                    let has_colors = self.led_colors.len() == self.leds.len()
-                        && !self.leds.is_empty();
-                    for (i, led) in self.leds.iter().enumerate() {
-                        if let Some(p) = project(led.x, led.y, led.z) {
-                            if rect.contains(p) {
-                                let color = if has_colors {
-                                    let [r, g, b] = self.led_colors[i];
-                                    egui::Color32::from_rgb(r, g, b)
-                                } else {
-                                    egui::Color32::from_gray(60)
-                                };
-                                painter.circle_filled(p, 3.0, color);
-                            }
+                    // LEDs — rendered as real 5mm cubes in a GL pass with a depth buffer
+                    // so closer LEDs correctly occlude farther ones. Projection matches the
+                    // 2D `project()` closure above (fovy = 2·atan(H/1000), scale = 500 px/m)
+                    // so tracking dots and camera axes overlay-align with the LED cubes.
+                    if let Some(renderer) = self.scene_renderer.clone() {
+                        let has_colors = self.led_colors.len() == self.leds.len()
+                            && !self.leds.is_empty();
+                        let mut inst: Vec<f32> = Vec::with_capacity(self.leds.len() * 6);
+                        for (i, led) in self.leds.iter().enumerate() {
+                            let (r, g, b) = if has_colors {
+                                let [r, g, b] = self.led_colors[i];
+                                (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+                            } else {
+                                (60.0 / 255.0, 60.0 / 255.0, 60.0 / 255.0)
+                            };
+                            inst.extend_from_slice(&[led.x, led.y, led.z, r, g, b]);
+                        }
+                        if !inst.is_empty() {
+                            let view = scene3d::look_at(
+                                eye,
+                                [0.0, 0.0, 0.0],
+                                [0.0, 1.0, 0.0],
+                            );
+                            let rw = rect.width().max(1.0);
+                            let rh = rect.height().max(1.0);
+                            let fovy = 2.0 * (rh / 1000.0).atan();
+                            let aspect = rw / rh;
+                            let proj = scene3d::perspective(fovy, aspect, 0.01, 100.0);
+                            let mvp = scene3d::mul_mat4(&proj, &view);
+                            let half_m = 0.0025_f32;
+                            let brightness = self.settings.brightness;
+                            let gamma = self.settings.gamma;
+                            let cb = egui_glow::CallbackFn::new(move |info, painter| {
+                                let vp = info.viewport_in_pixels();
+                                if let Ok(mut r) = renderer.lock() {
+                                    r.paint(
+                                        painter.gl(),
+                                        (vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px),
+                                        &mvp,
+                                        half_m,
+                                        brightness,
+                                        gamma,
+                                        &inst,
+                                    );
+                                }
+                            });
+                            painter.add(egui::PaintCallback {
+                                rect,
+                                callback: Arc::new(cb),
+                            });
                         }
                     }
 
                     // Tracking locations — larger cyan dots with short UUID label
                     for tp in &self.tracking {
-                        let is_locked_tp = self
-                            .locked_location
-                            .as_deref()
-                            .map(|n| n == tp.name)
-                            .unwrap_or(false);
+                        let is_locked_tp = matches!(
+                            &self.scene_lock,
+                            SceneLock::Tracked(n) if n == &tp.name
+                        );
                         let is_pending = self
                             .calib_pending_cam
                             .map(|p| p[0] == tp.x && p[1] == tp.y && p[2] == tp.z)
@@ -1493,6 +1680,17 @@ impl eframe::App for App {
                         egui::Color32::from_gray(100),
                     );
             });
+
+        // Drain the virtual-location and tracking-enabled sends deferred from
+        // inside the Scene window. Ordering matters on Off → non-Virtual: send
+        // enable=true *before* the virtual-clear so the freeze isn't lifted
+        // with a stale override still in place on the server.
+        if let Some(enabled) = pending_tracking_enabled {
+            self.send_tracking_enabled(enabled);
+        }
+        if let Some(xyz) = pending_virtual_send {
+            self.send_virtual_location(xyz);
+        }
 
         // ── Patterns window ───────────────────────────────────────
         egui::Window::new("Patterns")
