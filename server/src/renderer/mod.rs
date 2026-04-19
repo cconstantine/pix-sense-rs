@@ -8,7 +8,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 use crate::db;
 use pipeline::{RendererPipeline, FRAME_DURATION};
@@ -24,13 +24,21 @@ pub fn run(
     led_colors_tx: watch::Sender<Option<String>>,
     running: Arc<AtomicBool>,
     sculpture_name: String,
+    settings_changed: Arc<Notify>,
 ) {
     // Wrap in a restart loop so a crash reinitialises rather than killing the thread.
     loop {
         if !running.load(Ordering::Relaxed) {
             return;
         }
-        if let Err(e) = run_inner(&pool, &tracking_rx, &led_colors_tx, &running, &sculpture_name) {
+        if let Err(e) = run_inner(
+            &pool,
+            &tracking_rx,
+            &led_colors_tx,
+            &running,
+            &sculpture_name,
+            &settings_changed,
+        ) {
             tracing::error!("Renderer crashed: {e:#} — restarting in 5s");
             std::thread::sleep(std::time::Duration::from_secs(5));
         } else {
@@ -45,6 +53,7 @@ fn run_inner(
     led_colors_tx: &watch::Sender<Option<String>>,
     running: &Arc<AtomicBool>,
     sculpture_name: &str,
+    settings_changed: &Arc<Notify>,
 ) -> anyhow::Result<()> {
     // Build a single-threaded Tokio runtime for async DB queries and OPC tasks.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -112,13 +121,13 @@ fn run_inner(
         let glsl_shared = new_glsl.clone();
         let name_shared = new_pattern_name.clone();
         let settings_shared = new_render_settings.clone();
-        let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
+        let notify = settings_changed.clone();
 
         rt.spawn(async move {
             settings_watcher(
                 pool,
                 sn,
-                db_url,
+                notify,
                 flag,
                 glsl_shared,
                 name_shared,
@@ -188,8 +197,8 @@ fn run_inner(
         }
 
         // Auto-rotate the active pattern once the configured interval elapses.
-        // The actual shader swap happens via the normal NOTIFY → hot-reload path
-        // after `set_active_pattern` updates the DB row.
+        // The actual shader swap happens via the normal hot-reload path after
+        // `set_active_pattern` updates the DB row and we kick the watcher.
         if current_rotation_minutes > 0.0 {
             let interval = Duration::from_secs_f32(current_rotation_minutes * 60.0);
             if last_switch.elapsed() >= interval {
@@ -210,6 +219,7 @@ fn run_inner(
                         tracing::warn!("auto-rotate: set_active_pattern failed: {e:#}");
                     } else {
                         tracing::info!("auto-rotate: switching to pattern '{}'", picked.name);
+                        settings_changed.notify_one();
                     }
                 });
                 // Reset regardless of outcome so we don't hammer on errors or
@@ -283,56 +293,32 @@ fn run_inner(
 }
 
 // ---------------------------------------------------------------------------
-// Settings watcher — listens for DB NOTIFY and reloads active pattern
+// Settings watcher — reloads active pattern when notified by the writer side.
 // ---------------------------------------------------------------------------
 
 async fn settings_watcher(
     pool: sqlx::PgPool,
     sculpture_name: String,
-    db_url: String,
+    settings_changed: Arc<Notify>,
     reload_flag: Arc<AtomicBool>,
     new_glsl: Arc<Mutex<String>>,
     new_pattern_name: Arc<Mutex<String>>,
     new_settings: Arc<Mutex<RenderSettings>>,
 ) {
-    if db_url.is_empty() {
-        return;
-    }
-    let mut listener = match sqlx::postgres::PgListener::connect(&db_url).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!("settings_watcher: PgListener connect failed: {e:#}");
-            return;
-        }
-    };
-    if let Err(e) = listener
-        .listen_all(["sculpture_settings_update", "patterns_update"])
-        .await
-    {
-        tracing::warn!("settings_watcher: listen failed: {e:#}");
-        return;
-    }
-    tracing::info!("settings_watcher: listening for pattern/settings changes");
-
+    tracing::info!("settings_watcher: waiting for in-process pattern/settings changes");
     loop {
-        match listener.recv().await {
-            Ok(_) => {
-                if let Some(active) = db::load_active_pattern(&pool, &sculpture_name).await {
-                    *new_glsl.lock().unwrap() = active.glsl_code;
-                    *new_pattern_name.lock().unwrap() = active.name;
-                    *new_settings.lock().unwrap() = (
-                        active.brightness,
-                        active.gamma,
-                        active.overscan,
-                        active.rotation_minutes,
-                    );
-                    reload_flag.store(true, Ordering::Release);
-                    tracing::info!("settings_watcher: pattern/settings change detected — flagging reload");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("settings_watcher: PgListener error: {e:#}");
-            }
+        settings_changed.notified().await;
+        if let Some(active) = db::load_active_pattern(&pool, &sculpture_name).await {
+            *new_glsl.lock().unwrap() = active.glsl_code;
+            *new_pattern_name.lock().unwrap() = active.name;
+            *new_settings.lock().unwrap() = (
+                active.brightness,
+                active.gamma,
+                active.overscan,
+                active.rotation_minutes,
+            );
+            reload_flag.store(true, Ordering::Release);
+            tracing::info!("settings_watcher: pattern/settings change detected — flagging reload");
         }
     }
 }

@@ -1,7 +1,7 @@
 use chrono::Utc;
 use pix_sense_common::{
     CameraExtrinsics, DetectionAlgo, DetectionConfig, Pattern, PatternUpdate, SculptureSettings,
-    StreamSelection,
+    StreamSelection, TrackingPoint,
 };
 use sqlx::{PgPool, Row as _};
 
@@ -45,16 +45,21 @@ pub async fn connect() -> Option<PgPool> {
 ///   1. Try to UPDATE an existing row within 0.1 m that is less than 1 second old.
 ///   2. If no row was updated, INSERT a new one with a fresh UUID name.
 /// Then DELETE all rows older than 1 second.
-pub async fn write_detections(pool: &PgPool, detections: &[[f32; 3]]) {
+///
+/// Returns the upserted rows so the caller can fan them out to in-process
+/// listeners (WebSocket clients, the renderer) without a follow-up SELECT.
+pub async fn write_detections(pool: &PgPool, detections: &[[f32; 3]]) -> Vec<TrackingPoint> {
     let now = Utc::now();
     let proximity: f64 = 0.1;
+    let mut written = Vec::with_capacity(detections.len());
 
     for &[x, y, z] in detections {
-        let (x, y, z) = (x as f64, y as f64, z as f64);
+        let (xd, yd, zd) = (x as f64, y as f64, z as f64);
 
         // Try to update the nearest existing row within the proximity window.
         // FOR UPDATE SKIP LOCKED avoids serialization conflicts under concurrent writes.
-        let result = sqlx::query(
+        // RETURNING surfaces the row's name so we can fan it out without re-querying.
+        let updated_name: Option<String> = sqlx::query_scalar(
             "UPDATE tracking_locations
              SET x = $1, y = $2, z = $3, updated_at = $4
              WHERE name = (
@@ -64,35 +69,42 @@ pub async fn write_detections(pool: &PgPool, detections: &[[f32; 3]]) {
                  ORDER BY sqrt((x - $1)^2 + (y - $2)^2 + (z - $3)^2)
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
-             )",
+             )
+             RETURNING name",
         )
-        .bind(x)
-        .bind(y)
-        .bind(z)
+        .bind(xd)
+        .bind(yd)
+        .bind(zd)
         .bind(now)
         .bind(proximity)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("DB update error: {e:#}");
+            None
+        });
+
+        if let Some(name) = updated_name {
+            written.push(TrackingPoint { name, x, y, z });
+            continue;
+        }
+
+        let name = "pixo-16".to_string();
+        match sqlx::query(
+            "INSERT INTO tracking_locations (name, x, y, z, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (name) DO UPDATE SET x = $2, y = $3, z = $4, updated_at = $5",
+        )
+        .bind(&name)
+        .bind(xd)
+        .bind(yd)
+        .bind(zd)
+        .bind(now)
         .execute(pool)
-        .await;
-
-        let rows_affected = result.map(|r| r.rows_affected()).unwrap_or(0);
-
-        if rows_affected == 0 {
-            let name = "pixo-16".to_string();
-            if let Err(e) = sqlx::query(
-                "INSERT INTO tracking_locations (name, x, y, z, updated_at)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (name) DO UPDATE SET x = $2, y = $3, z = $4, updated_at = $5",
-            )
-            .bind(&name)
-            .bind(x)
-            .bind(y)
-            .bind(z)
-            .bind(now)
-            .execute(pool)
-            .await
-            {
-                tracing::warn!("DB insert error: {e:#}");
-            }
+        .await
+        {
+            Ok(_) => written.push(TrackingPoint { name, x, y, z }),
+            Err(e) => tracing::warn!("DB insert error: {e:#}"),
         }
     }
 
@@ -105,6 +117,8 @@ pub async fn write_detections(pool: &PgPool, detections: &[[f32; 3]]) {
     {
         tracing::warn!("DB expire error: {e:#}");
     }
+
+    written
 }
 
 /// Load the stored camera extrinsics for the given camera, or None if not calibrated.

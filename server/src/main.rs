@@ -24,10 +24,10 @@ use image::RgbImage;
 use pix_sense_common::{
     encode_frame_message, CalibrationPoint, CameraExtrinsics, ClientMessage, DetectionConfig,
     FaceDetection, FrameMetadata, LedPoint, Pattern, PatternUpdate, SculptureSettings,
-    ServerMessage, TrackingPoint,
+    ServerMessage,
 };
 use sqlx::{PgPool, Row as _};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tower_http::services::ServeDir;
 
 use prometheus::{
@@ -245,6 +245,10 @@ struct AppState {
     cameras: Arc<HashMap<String, CameraRuntime>>,
     /// Sculpture name from SCULPTURE_NAME env var — used for pattern activation.
     sculpture_name: Arc<String>,
+    /// Fired by HTTP write handlers (and the renderer's auto-rotate loop) to
+    /// signal the renderer's settings_watcher that the active pattern or
+    /// sculpture settings have changed and need to be reloaded from the DB.
+    settings_changed: Arc<Notify>,
 }
 
 #[tokio::main]
@@ -352,12 +356,13 @@ async fn main() -> Result<()> {
 
     let pending_selection: Arc<Mutex<Option<[f32; 3]>>> = Arc::new(Mutex::new(None));
 
-    // Virtual tracking override — set via `ClientMessage::VirtualLocation` and drained
-    // by `tracking_listener` when deciding the renderer's input position.
+    // Virtual tracking override — set via `ClientMessage::VirtualLocation` and read
+    // by the DB writer task (and the WS handler itself) when deciding the
+    // renderer's input position.
     let virtual_override: Arc<RwLock<Option<[f32; 3]>>> = Arc::new(RwLock::new(None));
 
-    // Toggled by `ClientMessage::TrackingEnabled`. False = freeze — the DB
-    // listener and virtual handler both stop writing to `tracking_pos_tx`.
+    // Toggled by `ClientMessage::TrackingEnabled`. False = freeze — the writer
+    // task and the virtual-location handler both stop writing to `tracking_pos_tx`.
     let tracking_enabled: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
 
     let metrics = Arc::new(Metrics::new());
@@ -432,16 +437,6 @@ async fn main() -> Result<()> {
     }
     drop(det_tx);
 
-    // Spawn async task that drains the XYZ channel and writes to postgres
-    if let Some(pool) = &db_pool {
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            while let Some(xyzs) = db_rx.recv().await {
-                db::write_detections(&pool, &xyzs).await;
-            }
-        });
-    }
-
     // Watch channel for broadcasting the latest tracked person position to the GL renderer.
     let (tracking_pos_tx, tracking_pos_rx) = watch::channel::<Option<[f32; 3]>>(None);
 
@@ -449,8 +444,9 @@ async fn main() -> Result<()> {
     // Value is pre-serialised JSON so the WS handler can forward it directly.
     let (led_colors_tx, led_colors_rx) = watch::channel::<Option<String>>(None);
 
-    // Spawn PgListener task that forwards tracking_location NOTIFYs to WebSocket clients
-    // and updates the tracking position watch channel for the renderer.
+    // Spawn async task that drains the XYZ channel, writes to postgres, and
+    // fans the upserted points out to WebSocket clients and the renderer.
+    // Replaces the old DB-NOTIFY round-trip — the trigger is gone.
     if let Some(pool) = &db_pool {
         let pool = pool.clone();
         let ws_tx = tracking_tx.clone();
@@ -458,7 +454,26 @@ async fn main() -> Result<()> {
         let virt = virtual_override.clone();
         let enabled = tracking_enabled.clone();
         tokio::spawn(async move {
-            tracking_listener(pool, ws_tx, pos_tx, virt, enabled).await;
+            while let Some(xyzs) = db_rx.recv().await {
+                let points = db::write_detections(&pool, &xyzs).await;
+                if points.is_empty() {
+                    continue;
+                }
+
+                // Update renderer with the first tracked position (primary person).
+                // Virtual override wins when set; when tracking is disabled, hold
+                // the renderer's last value so the operator can freeze-frame the LEDs.
+                if enabled.load(Ordering::Relaxed) {
+                    let renderer_pos = points.first().map(|p| [p.x, p.y, p.z]);
+                    let effective = virt.read().unwrap().or(renderer_pos);
+                    let _ = pos_tx.send(effective);
+                }
+
+                if let Ok(json) = serde_json::to_string(&ServerMessage::Tracking(points)) {
+                    // Ignore error — no WS subscribers connected is fine.
+                    let _ = ws_tx.send(json);
+                }
+            }
         });
     }
 
@@ -467,15 +482,21 @@ async fn main() -> Result<()> {
     );
     tracing::info!("Sculpture name: {}", sculpture_name);
 
+    // Notifier fired by pattern/settings HTTP writes (and the renderer's own
+    // auto-rotate loop) — the renderer's settings_watcher waits on this and
+    // reloads active pattern + display settings from the DB.
+    let settings_changed = Arc::new(Notify::new());
+
     // Spawn the headless GLSL renderer thread (requires DB to be configured).
     if let Some(pool) = &db_pool {
         let pool = pool.clone();
         let rx = tracking_pos_rx;
         let sname = (*sculpture_name).clone();
         let running_r = running.clone();
+        let notify = settings_changed.clone();
         std::thread::Builder::new()
             .name("gl-renderer".into())
-            .spawn(move || renderer::run(pool, rx, led_colors_tx, running_r, sname))
+            .spawn(move || renderer::run(pool, rx, led_colors_tx, running_r, sname, notify))
             .expect("spawn gl-renderer thread");
     }
 
@@ -491,6 +512,7 @@ async fn main() -> Result<()> {
         tracking_enabled,
         cameras: Arc::new(cameras),
         sculpture_name,
+        settings_changed,
     };
 
     let app = Router::new()
@@ -625,7 +647,7 @@ async fn handle_ws(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            // Tracking location update from DB LISTEN — forward as JSON text
+            // Tracking location update from the DB writer task — forward as JSON text
             Ok(json) = tracking_rx.recv() => {
                 if socket.send(Message::Text(json.into())).await.is_err() {
                     break; // client disconnected
@@ -698,8 +720,8 @@ async fn handle_ws(
                             }
                             Ok(ClientMessage::TrackingEnabled(enabled)) => {
                                 tracking_enabled.store(enabled, Ordering::Relaxed);
-                                // Intentionally don't push on re-enable: the next DB
-                                // NOTIFY (or the next VirtualLocation message) will
+                                // Intentionally don't push on re-enable: the next
+                                // detection batch (or VirtualLocation message) will
                                 // refresh the renderer's input within a frame or two.
                             }
                             Err(e) => {
@@ -714,80 +736,6 @@ async fn handle_ws(
         }
     }
     tracing::info!("WebSocket client disconnected");
-}
-
-/// Listens for PostgreSQL NOTIFY on `tracking_location_update`, queries fresh rows,
-/// broadcasts the JSON-encoded list to all connected WebSocket clients, and updates
-/// the renderer's tracking position watch channel.
-async fn tracking_listener(
-    pool: PgPool,
-    ws_tx: broadcast::Sender<String>,
-    pos_tx: watch::Sender<Option<[f32; 3]>>,
-    virtual_override: Arc<RwLock<Option<[f32; 3]>>>,
-    tracking_enabled: Arc<AtomicBool>,
-) {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        tracing::warn!("DATABASE_URL not set, tracking_listener exiting");
-        return;
-    };
-    let mut listener = match sqlx::postgres::PgListener::connect(&database_url).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("PgListener connect failed: {:#}", e);
-            return;
-        }
-    };
-    if let Err(e) = listener.listen("tracking_location_update").await {
-        tracing::error!("PgListener listen failed: {:#}", e);
-        return;
-    }
-    tracing::info!("Listening for tracking_location_update notifications");
-
-    loop {
-        match listener.recv().await {
-            Ok(_notification) => {
-                let rows = sqlx::query(
-                    "SELECT name, x, y, z FROM tracking_locations \
-                     WHERE updated_at > now() - interval '1 second'",
-                )
-                .fetch_all(&pool)
-                .await
-                .unwrap_or_default();
-
-                let points: Vec<TrackingPoint> = rows
-                    .into_iter()
-                    .map(|r| TrackingPoint {
-                        name: r.get("name"),
-                        x: r.get("x"),
-                        y: r.get("y"),
-                        z: r.get("z"),
-                    })
-                    .collect();
-
-                // Update renderer with the first tracked position (primary person).
-                // Virtual override wins when set — the client is driving a simulated
-                // location through the UI and we want the LEDs to react to that.
-                // When tracking is disabled, skip the push so the renderer holds
-                // its last value — lets the operator freeze-frame the LEDs.
-                if tracking_enabled.load(Ordering::Relaxed) {
-                    let renderer_pos = points.first().map(|p| [p.x, p.y, p.z]);
-                    let effective = virtual_override.read().unwrap().or(renderer_pos);
-                    let _ = pos_tx.send(effective);
-                }
-
-                if let Ok(json) =
-                    serde_json::to_string(&ServerMessage::Tracking(points))
-                {
-                    // Ignore error — no subscribers connected is fine
-                    let _ = ws_tx.send(json);
-                }
-            }
-            Err(e) => {
-                // sqlx PgListener auto-reconnects on transient errors
-                tracing::warn!("PgListener error: {:#}", e);
-            }
-        }
-    }
 }
 
 async fn leds_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -1105,7 +1053,10 @@ async fn create_pattern_handler(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match db::create_pattern(pool, &pattern).await {
-        Ok(()) => StatusCode::CREATED.into_response(),
+        Ok(()) => {
+            state.settings_changed.notify_one();
+            StatusCode::CREATED.into_response()
+        }
         Err(e)
             if e.as_database_error()
                 .map(|d| d.is_unique_violation())
@@ -1146,7 +1097,10 @@ async fn update_pattern_handler(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match db::update_pattern(pool, &name, &update).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            state.settings_changed.notify_one();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::warn!("update_pattern error: {e:#}");
@@ -1182,6 +1136,7 @@ async fn activate_pattern_handler(
     match db::set_active_pattern(pool, &state.sculpture_name, &name).await {
         Ok(()) => {
             tracing::info!("Active pattern set to '{}' for sculpture '{}'", name, state.sculpture_name);
+            state.settings_changed.notify_one();
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
@@ -1225,7 +1180,10 @@ async fn put_settings_handler(
         rotation_minutes: settings.rotation_minutes.clamp(0.0, 1440.0),
     };
     match db::update_sculpture_settings(pool, &state.sculpture_name, &clamped).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            state.settings_changed.notify_one();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::warn!("update_sculpture_settings error: {e:#}");

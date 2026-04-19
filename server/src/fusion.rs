@@ -180,8 +180,8 @@ pub fn spawn(
             // sticking in the outgoing metadata.
             match picked {
                 Some((track_idx, world_xyz)) => {
-                    // Forward to the DB writer (and thus to the renderer via
-                    // tracking_locations NOTIFY).
+                    // Forward to the DB writer task, which both persists the
+                    // detection and fans it out to the renderer + WS clients.
                     let _ = db_tx.send(vec![world_xyz]);
 
                     let track = &tracks[track_idx];
