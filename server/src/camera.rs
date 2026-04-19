@@ -13,6 +13,7 @@ use realsense_rust::{
     },
 };
 use std::collections::HashSet;
+use std::ffi::CString;
 
 /// Pinhole camera intrinsics for the colour stream (all streams are aligned to it).
 #[derive(Debug, Clone, Copy)]
@@ -48,47 +49,60 @@ pub struct CameraFrames {
     pub intrinsics: CameraIntrinsics,
 }
 
-/// Query the serial number of the first connected RealSense device without
-/// starting the full pipeline. Returns `None` if no device is found.
-pub fn query_serial() -> Option<String> {
-    let context = RsContext::new().ok()?;
+/// One RealSense device detected at enumeration time. The `device` handle is
+/// discarded on open — we bind the pipeline to the device via its serial.
+#[derive(Debug, Clone)]
+pub struct EnumeratedDevice {
+    pub serial: String,
+    pub name: String,
+}
+
+/// Enumerate all connected RealSense devices without starting any pipeline.
+/// Returns an empty vec if no devices are found (callers may still want to
+/// serve non-camera routes, e.g. patterns/settings).
+pub fn enumerate() -> Result<Vec<EnumeratedDevice>> {
+    let context = RsContext::new().context("Failed to create RealSense context")?;
     let devices = context.query_devices(HashSet::new());
-    let device = devices.first()?;
-    Some(
-        device
+    let mut out = Vec::with_capacity(devices.len());
+    for device in devices.iter() {
+        let serial = device
             .info(Rs2CameraInfo::SerialNumber)
             .unwrap_or_default()
             .to_string_lossy()
-            .into_owned(),
-    )
+            .into_owned();
+        let name = device
+            .info(Rs2CameraInfo::Name)
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if serial.is_empty() {
+            tracing::warn!("Skipping RealSense device with missing serial ({})", name);
+            continue;
+        }
+        out.push(EnumeratedDevice { serial, name });
+    }
+    Ok(out)
 }
 
 impl Camera {
-    pub fn new() -> Result<Self> {
+    /// Open a pipeline bound to the device with the given serial.
+    pub fn new(device: &EnumeratedDevice) -> Result<Self> {
         let context = RsContext::new().context("Failed to create RealSense context")?;
 
-        let devices = context.query_devices(HashSet::new());
-        if devices.len() == 0 {
-            anyhow::bail!("No RealSense devices found. Is the camera connected?");
-        }
-
-        let device = &devices[0];
         tracing::info!(
-            "Found RealSense device: {} {}",
-            device
-                .info(Rs2CameraInfo::Name)
-                .unwrap_or_default()
-                .to_string_lossy(),
-            device
-                .info(Rs2CameraInfo::SerialNumber)
-                .unwrap_or_default()
-                .to_string_lossy(),
+            "Opening RealSense device: {} {}",
+            device.name, device.serial
         );
 
         let pipeline =
             InactivePipeline::try_from(&context).context("Failed to create pipeline")?;
 
         let mut config = Config::new();
+        let serial_c = CString::new(device.serial.as_bytes())
+            .context("Camera serial contains interior nul byte")?;
+        config
+            .enable_device_from_serial(&serial_c)
+            .context("Failed to bind pipeline to camera serial")?;
         config
             .enable_stream(Rs2StreamKind::Color, None, 1280, 720, Rs2Format::Rgb8, 30)
             .context("Failed to enable color stream")?;

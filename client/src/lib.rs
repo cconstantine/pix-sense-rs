@@ -9,10 +9,18 @@ use pix_sense_common::{
     ServerMessage, StreamSelection, TrackingPoint,
 };
 use scene3d::SceneRenderer;
+use serde::Deserialize;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
+
+#[derive(Debug, Clone, Deserialize)]
+struct CameraInfo {
+    id: String,
+    name: String,
+}
 
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
@@ -115,9 +123,9 @@ fn is_valid_pattern_name(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
-struct App {
-    ws_sender: WsSender,
-    ws_receiver: WsReceiver,
+/// Per-camera UI state. One `CameraView` per active RealSense device.
+struct CameraView {
+    name: String,
     rgb_texture: Option<egui::TextureHandle>,
     ir_texture: Option<egui::TextureHandle>,
     latest_rgb_faces: Vec<FaceDetection>,
@@ -127,6 +135,55 @@ struct App {
     roi_rect: Option<[u32; 4]>,
     tracked_rgb_idx: Option<usize>,
     tracked_ir_idx: Option<usize>,
+    /// Current extrinsics for this camera (None = uncalibrated / identity).
+    extrinsics: Option<CameraExtrinsics>,
+    /// Session calibration point pairs collected for this camera.
+    calib_points: Vec<CalibrationPoint>,
+    /// Translation sliders, synced to `extrinsics.t`.
+    manual_t: [f32; 3],
+    /// Euler XYZ rotation degrees (R = Rz·Ry·Rx), synced to `extrinsics.r`.
+    manual_euler_deg: [f32; 3],
+    /// Async fetch cells for this camera's extrinsics + points. The outer
+    /// Option marks "fetch pending"; the inner Option<CameraExtrinsics> marks
+    /// "204 = no extrinsics stored".
+    extrinsics_pending: Rc<RefCell<Option<Option<CameraExtrinsics>>>>,
+    points_pending: Rc<RefCell<Option<Vec<CalibrationPoint>>>>,
+}
+
+impl CameraView {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            rgb_texture: None,
+            ir_texture: None,
+            latest_rgb_faces: Vec::new(),
+            latest_ir_faces: Vec::new(),
+            rgb_size: [640, 480],
+            ir_size: [640, 480],
+            roi_rect: None,
+            tracked_rgb_idx: None,
+            tracked_ir_idx: None,
+            extrinsics: None,
+            calib_points: Vec::new(),
+            manual_t: [0.0; 3],
+            manual_euler_deg: [0.0; 3],
+            extrinsics_pending: Rc::new(RefCell::new(None)),
+            points_pending: Rc::new(RefCell::new(None)),
+        }
+    }
+}
+
+struct App {
+    ws_sender: WsSender,
+    ws_receiver: WsReceiver,
+    /// All cameras, keyed by serial. Populated via `/api/cameras` fetch and
+    /// self-seeded when a WS frame arrives for an unknown camera.
+    cameras: BTreeMap<String, CameraView>,
+    /// Initial camera list fetch; drained into `cameras` once received.
+    camera_list_pending: Rc<RefCell<Option<Vec<CameraInfo>>>>,
+    /// Which camera the calibration panel is currently editing. Defaults to
+    /// the first known camera; user-selectable via a ComboBox.
+    selected_calib_camera: Option<String>,
     fps_counter: FpsCounter,
     connected: bool,
     /// Config the user has selected in the UI (sent to server on change).
@@ -162,27 +219,12 @@ struct App {
     calib_mode: bool,
     /// Which capture workflow is active within calibration mode.
     calib_sub_mode: CalibrationMode,
-    /// Point pairs collected so far (mirrors server-side list for this session).
-    calib_points: Vec<CalibrationPoint>,
     /// World-frame XYZ typed by the user (pending pairing with a cam point).
     calib_world_input: [String; 3],
     /// Camera-frame point captured by clicking a tracking dot.
     calib_pending_cam: Option<[f32; 3]>,
     /// Last error message from a stand-in-view capture attempt (shown briefly).
     calib_capture_error: Rc<RefCell<Option<String>>>,
-    /// Current extrinsics (None = identity / uncalibrated).
-    extrinsics: Option<CameraExtrinsics>,
-    /// Camera serial number fetched from server.
-    camera_id: String,
-    // Async fetch pending cells (same pattern as led_pending)
-    extrinsics_pending: Rc<RefCell<Option<Option<CameraExtrinsics>>>>,
-    points_pending: Rc<RefCell<Option<Vec<CalibrationPoint>>>>,
-    camera_id_pending: Rc<RefCell<Option<String>>>,
-    // Manual extrinsics editor state
-    /// Translation in metres, synced to/from `extrinsics.t`.
-    manual_t: [f32; 3],
-    /// Euler XYZ rotation angles in degrees (R = Rz·Ry·Rx), synced to/from `extrinsics.r`.
-    manual_euler_deg: [f32; 3],
     // Patterns panel
     patterns: Vec<Pattern>,
     patterns_pending: Rc<RefCell<Option<Vec<Pattern>>>>,
@@ -251,48 +293,17 @@ impl App {
             }
         });
 
-        // Fetch camera serial number.
-        let camera_id_pending: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let cid_clone = camera_id_pending.clone();
+        // Fetch the list of active cameras. Per-camera extrinsics + points
+        // fetches are kicked off from `update()` once the list arrives —
+        // keeping App::new small (no per-camera async scheduling here) means
+        // WS frames arriving before the camera list can still self-seed the
+        // BTreeMap via `or_insert_with` in `handle_binary_message`.
+        let camera_list_pending: Rc<RefCell<Option<Vec<CameraInfo>>>> = Rc::new(RefCell::new(None));
+        let cl_clone = camera_list_pending.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(resp) = gloo_net::http::Request::get("/api/calibration/camera_id")
-                .send()
-                .await
-            {
-                if let Ok(text) = resp.text().await {
-                    *cid_clone.borrow_mut() = Some(text);
-                }
-            }
-        });
-
-        // Fetch existing extrinsics (204 = none stored).
-        let extrinsics_pending: Rc<RefCell<Option<Option<CameraExtrinsics>>>> =
-            Rc::new(RefCell::new(None));
-        let ext_clone = extrinsics_pending.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(resp) = gloo_net::http::Request::get("/api/calibration/extrinsics")
-                .send()
-                .await
-            {
-                if resp.status() == 204 {
-                    *ext_clone.borrow_mut() = Some(None);
-                } else if let Ok(ext) = resp.json::<CameraExtrinsics>().await {
-                    *ext_clone.borrow_mut() = Some(Some(ext));
-                }
-            }
-        });
-
-        // Fetch calibration points collected in a previous session on the server.
-        let points_pending: Rc<RefCell<Option<Vec<CalibrationPoint>>>> =
-            Rc::new(RefCell::new(None));
-        let pts_clone = points_pending.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(resp) = gloo_net::http::Request::get("/api/calibration/points")
-                .send()
-                .await
-            {
-                if let Ok(pts) = resp.json::<Vec<CalibrationPoint>>().await {
-                    *pts_clone.borrow_mut() = Some(pts);
+            if let Ok(resp) = gloo_net::http::Request::get("/api/cameras").send().await {
+                if let Ok(list) = resp.json::<Vec<CameraInfo>>().await {
+                    *cl_clone.borrow_mut() = Some(list);
                 }
             }
         });
@@ -339,15 +350,9 @@ impl App {
         Self {
             ws_sender,
             ws_receiver,
-            rgb_texture: None,
-            ir_texture: None,
-            latest_rgb_faces: Vec::new(),
-            latest_ir_faces: Vec::new(),
-            rgb_size: [640, 480],
-            ir_size: [640, 480],
-            roi_rect: None,
-            tracked_rgb_idx: None,
-            tracked_ir_idx: None,
+            cameras: BTreeMap::new(),
+            camera_list_pending,
+            selected_calib_camera: None,
             fps_counter: FpsCounter::new(),
             connected: false,
             local_config: DetectionConfig::default(),
@@ -368,17 +373,9 @@ impl App {
             last_virtual_send: 0.0,
             calib_mode: false,
             calib_sub_mode: CalibrationMode::PickPoint,
-            calib_points: Vec::new(),
             calib_world_input: [String::new(), String::new(), String::new()],
             calib_pending_cam: None,
             calib_capture_error: Rc::new(RefCell::new(None)),
-            extrinsics: None,
-            camera_id: String::new(),
-            extrinsics_pending,
-            points_pending,
-            camera_id_pending,
-            manual_t: [0.0; 3],
-            manual_euler_deg: [0.0; 3],
             patterns: Vec::new(),
             patterns_pending,
             active_pattern: String::new(),
@@ -399,27 +396,81 @@ impl App {
         }
     }
 
+    /// Ensure a CameraView exists for this id, lazily kicking off extrinsics
+    /// + points fetches the first time it appears. Called both when a WS
+    /// frame arrives and when the `/api/cameras` list lands.
+    fn ensure_camera(&mut self, id: &str, name: Option<&str>) {
+        if self.cameras.contains_key(id) {
+            if let Some(n) = name {
+                if let Some(view) = self.cameras.get_mut(id) {
+                    if view.name.is_empty() {
+                        view.name = n.to_string();
+                    }
+                }
+            }
+            return;
+        }
+        let view = CameraView::new(name.unwrap_or("").to_string());
+
+        let id_owned = id.to_string();
+        let ext_cell = view.extrinsics_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let url = format!("/api/cameras/{}/extrinsics", id_owned);
+            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
+                if resp.status() == 204 {
+                    *ext_cell.borrow_mut() = Some(None);
+                } else if let Ok(ext) = resp.json::<CameraExtrinsics>().await {
+                    *ext_cell.borrow_mut() = Some(Some(ext));
+                }
+            }
+        });
+
+        let id_owned = id.to_string();
+        let pts_cell = view.points_pending.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let url = format!("/api/cameras/{}/points", id_owned);
+            if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
+                if let Ok(pts) = resp.json::<Vec<CalibrationPoint>>().await {
+                    *pts_cell.borrow_mut() = Some(pts);
+                }
+            }
+        });
+
+        self.cameras.insert(id.to_string(), view);
+        if self.selected_calib_camera.is_none() {
+            self.selected_calib_camera = Some(id.to_string());
+        }
+    }
+
     fn handle_binary_message(&mut self, ctx: &egui::Context, data: &[u8]) {
         let Some((rgb_jpeg, ir_jpeg, metadata)) = decode_frame_message(data) else {
             return;
         };
 
-        self.latest_rgb_faces = metadata.rgb_faces;
-        self.latest_ir_faces = metadata.ir_faces;
-        self.rgb_size = metadata.rgb_size;
-        self.ir_size = metadata.ir_size;
+        let camera_id = metadata.camera_id.clone();
+        self.ensure_camera(&camera_id, None);
         self.active_config = metadata.active_config;
-        self.roi_rect = metadata.roi_rect;
-        self.tracked_rgb_idx = metadata.tracked_rgb_idx;
-        self.tracked_ir_idx = metadata.tracked_ir_idx;
 
-        // Decode RGB JPEG
+        let Some(view) = self.cameras.get_mut(&camera_id) else {
+            return;
+        };
+
+        view.latest_rgb_faces = metadata.rgb_faces;
+        view.latest_ir_faces = metadata.ir_faces;
+        view.rgb_size = metadata.rgb_size;
+        view.ir_size = metadata.ir_size;
+        view.roi_rect = metadata.roi_rect;
+        view.tracked_rgb_idx = metadata.tracked_rgb_idx;
+        view.tracked_ir_idx = metadata.tracked_ir_idx;
+
+        // Decode RGB JPEG. Texture names include the camera id so egui treats
+        // them as distinct entries in its texture cache.
         if let Some(color_image) = decode_jpeg_rgb(rgb_jpeg) {
-            match &mut self.rgb_texture {
+            match &mut view.rgb_texture {
                 Some(tex) => tex.set(color_image, egui::TextureOptions::LINEAR),
                 None => {
-                    self.rgb_texture = Some(ctx.load_texture(
-                        "rgb_feed",
+                    view.rgb_texture = Some(ctx.load_texture(
+                        format!("rgb_feed_{}", camera_id),
                         color_image,
                         egui::TextureOptions::LINEAR,
                     ));
@@ -429,11 +480,11 @@ impl App {
 
         // Decode IR JPEG (grayscale)
         if let Some(color_image) = decode_jpeg_gray(ir_jpeg) {
-            match &mut self.ir_texture {
+            match &mut view.ir_texture {
                 Some(tex) => tex.set(color_image, egui::TextureOptions::LINEAR),
                 None => {
-                    self.ir_texture = Some(ctx.load_texture(
-                        "ir_feed",
+                    view.ir_texture = Some(ctx.load_texture(
+                        format!("ir_feed_{}", camera_id),
                         color_image,
                         egui::TextureOptions::LINEAR,
                     ));
@@ -452,9 +503,10 @@ impl App {
         }
     }
 
-    /// Tell the server to lock tracking onto the given camera-frame XYZ.
-    fn send_select_person(&mut self, xyz: [f32; 3]) {
-        let msg = ClientMessage::SelectPerson { xyz };
+    /// Tell the server to lock tracking onto the given camera-frame XYZ as
+    /// seen by `camera_id`.
+    fn send_select_person(&mut self, camera_id: String, xyz: [f32; 3]) {
+        let msg = ClientMessage::SelectPerson { camera_id, xyz };
         if let Ok(json) = serde_json::to_string(&msg) {
             self.ws_sender.send(WsMessage::Text(json));
         }
@@ -588,20 +640,34 @@ impl eframe::App for App {
         if let Some(leds) = self.led_pending.borrow_mut().take() {
             self.leds = leds;
         }
-        // Drain calibration fetch results
-        if let Some(id) = self.camera_id_pending.borrow_mut().take() {
-            self.camera_id = id;
-        }
-        if let Some(maybe_ext) = self.extrinsics_pending.borrow_mut().take() {
-            self.extrinsics = maybe_ext;
-            if let Some(ref ext) = self.extrinsics {
-                self.manual_t = ext.t;
-                self.manual_euler_deg = rotation_to_euler_deg(&ext.r);
+
+        // Drain the camera list, seeding CameraView entries and kicking off
+        // per-camera extrinsics + points fetches. Harmless if a WS frame has
+        // already self-seeded one of the entries — ensure_camera is idempotent.
+        // Take the list into a local so the RefMut doesn't outlive the loop.
+        let maybe_list = self.camera_list_pending.borrow_mut().take();
+        if let Some(list) = maybe_list {
+            for info in list {
+                self.ensure_camera(&info.id, Some(&info.name));
             }
         }
-        if let Some(pts) = self.points_pending.borrow_mut().take() {
-            self.calib_points = pts;
+
+        // Drain per-camera extrinsics + points fetch results into each view.
+        // Done across all cameras every frame: the inner cells are None once
+        // drained, so this is cheap.
+        for view in self.cameras.values_mut() {
+            if let Some(maybe_ext) = view.extrinsics_pending.borrow_mut().take() {
+                view.extrinsics = maybe_ext;
+                if let Some(ref ext) = view.extrinsics {
+                    view.manual_t = ext.t;
+                    view.manual_euler_deg = rotation_to_euler_deg(&ext.r);
+                }
+            }
+            if let Some(pts) = view.points_pending.borrow_mut().take() {
+                view.calib_points = pts;
+            }
         }
+
         if let Some(patterns) = self.patterns_pending.borrow_mut().take() {
             self.patterns = patterns;
         }
@@ -663,12 +729,17 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let status = if self.connected { "Connected" } else { "Disconnected" };
+                // Summed face counts across every active camera.
+                let (rgb_total, ir_total) = self.cameras.values().fold((0, 0), |acc, v| {
+                    (acc.0 + v.latest_rgb_faces.len(), acc.1 + v.latest_ir_faces.len())
+                });
                 ui.label(format!(
-                    "{} | FPS: {:.1} | RGB: {} | IR: {}",
+                    "{} | Cams: {} | FPS: {:.1} | RGB: {} | IR: {}",
                     status,
+                    self.cameras.len(),
                     self.fps_counter.fps,
-                    self.latest_rgb_faces.len(),
-                    self.latest_ir_faces.len(),
+                    rgb_total,
+                    ir_total,
                 ));
 
                 ui.separator();
@@ -796,147 +867,135 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |_ui| {});
 
         // ── Cameras window ────────────────────────────────────────
-        // Clicks on face boxes flow out of the closure via these locals, so we can
-        // call `self.send_select_person` after the `open: &mut self.show_cameras`
-        // borrow is released.
-        let mut rgb_selection: Option<[f32; 3]> = None;
-        let mut ir_selection: Option<[f32; 3]> = None;
+        // Grid layout: every active camera renders in its own cell containing
+        // the active stream (RGB xor IR, per global config). Click-to-select
+        // flows out of the closure via `pending_selection` so we can call
+        // `send_select_person` after the `open: &mut self.show_cameras` borrow
+        // is released.
+        let mut pending_selection: Option<(String, [f32; 3])> = None;
         egui::Window::new("Cameras")
-            .default_size([640.0, 400.0])
+            .default_size([700.0, 520.0])
             .default_pos([10.0, 80.0])
             .open(&mut self.show_cameras)
             .show(ctx, |ui| {
-                    let show_rgb = matches!(self.active_config.stream, StreamSelection::Rgb);
-                    let show_ir = matches!(self.active_config.stream, StreamSelection::Ir);
-                    let num_panels = show_rgb as u32 + show_ir as u32;
+                if self.cameras.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.colored_label(
+                            egui::Color32::from_gray(140),
+                            "Waiting for cameras…",
+                        );
+                    });
+                    return;
+                }
 
-                    ui.horizontal(|ui| {
-                        let available = ui.available_size();
-                        let panel_width = if num_panels > 0 {
-                            (available.x - 10.0 * (num_panels - 1) as f32) / num_panels as f32
-                        } else {
-                            available.x
-                        };
+                let show_rgb = matches!(self.active_config.stream, StreamSelection::Rgb);
+                let n = self.cameras.len();
+                let cols = (n as f32).sqrt().ceil() as usize;
+                let cols = cols.max(1);
+                let available = ui.available_size();
+                let gap = 8.0_f32;
+                let cell_w = ((available.x - gap * (cols - 1) as f32) / cols as f32).max(120.0);
 
-                        if show_rgb {
-                            ui.vertical(|ui| {
-                                ui.label("RGB + Face");
-                                if let Some(tex) = &self.rgb_texture {
-                                    let aspect = self.rgb_size[1] as f32 / self.rgb_size[0] as f32;
-                                    let display_h = panel_width * aspect;
-                                    let display_size = egui::vec2(panel_width, display_h);
+                let cam_ids: Vec<String> = self.cameras.keys().cloned().collect();
+                egui::ScrollArea::vertical()
+                    .id_salt("cam_grid_scroll")
+                    .show(ui, |ui| {
+                        let mut iter = cam_ids.into_iter().peekable();
+                        while iter.peek().is_some() {
+                            ui.horizontal(|ui| {
+                                for _ in 0..cols {
+                                    let Some(id) = iter.next() else { break };
+                                    ui.vertical(|ui| {
+                                        ui.set_width(cell_w);
+                                        let Some(view) = self.cameras.get(&id) else {
+                                            return;
+                                        };
+                                        let label = if view.name.is_empty() {
+                                            id.clone()
+                                        } else {
+                                            format!("{} ({})", view.name, id)
+                                        };
+                                        ui.small(label);
 
-                                    let (rect, _response) =
-                                        ui.allocate_exact_size(display_size, egui::Sense::hover());
+                                        let (tex_opt, size, faces, tracked_idx, salt_prefix) =
+                                            if show_rgb {
+                                                (
+                                                    view.rgb_texture.as_ref(),
+                                                    view.rgb_size,
+                                                    &view.latest_rgb_faces,
+                                                    view.tracked_rgb_idx,
+                                                    "rgb_face_",
+                                                )
+                                            } else {
+                                                (
+                                                    view.ir_texture.as_ref(),
+                                                    view.ir_size,
+                                                    &view.latest_ir_faces,
+                                                    view.tracked_ir_idx,
+                                                    "ir_face_",
+                                                )
+                                            };
 
-                                    ui.painter().image(
-                                        tex.id(),
-                                        rect,
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        egui::Color32::WHITE,
-                                    );
-
-                                    let scale_x = rect.width() / self.rgb_size[0] as f32;
-                                    let scale_y = rect.height() / self.rgb_size[1] as f32;
-                                    let clicked = overlay::draw_faces(
-                                        ui,
-                                        &self.latest_rgb_faces,
-                                        rect.left_top(),
-                                        scale_x,
-                                        scale_y,
-                                        self.tracked_rgb_idx,
-                                        "rgb_face",
-                                    );
-                                    overlay::draw_roi(
-                                        ui.painter(),
-                                        self.roi_rect,
-                                        rect.left_top(),
-                                        scale_x,
-                                        scale_y,
-                                    );
-                                    if let Some(i) = clicked {
-                                        if let Some(xyz) = self
-                                            .latest_rgb_faces
-                                            .get(i)
-                                            .and_then(|f| f.xyz)
-                                        {
-                                            rgb_selection = Some(xyz);
+                                        if let Some(tex) = tex_opt {
+                                            let aspect = size[1] as f32 / size[0] as f32;
+                                            let display_h = cell_w * aspect;
+                                            let display_size = egui::vec2(cell_w, display_h);
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                display_size,
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().image(
+                                                tex.id(),
+                                                rect,
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                            let scale_x = rect.width() / size[0] as f32;
+                                            let scale_y = rect.height() / size[1] as f32;
+                                            let salt = format!("{salt_prefix}{id}");
+                                            let clicked = overlay::draw_faces(
+                                                ui,
+                                                faces,
+                                                rect.left_top(),
+                                                scale_x,
+                                                scale_y,
+                                                tracked_idx,
+                                                &salt,
+                                            );
+                                            overlay::draw_roi(
+                                                ui.painter(),
+                                                view.roi_rect,
+                                                rect.left_top(),
+                                                scale_x,
+                                                scale_y,
+                                            );
+                                            if let Some(i) = clicked {
+                                                if let Some(xyz) =
+                                                    faces.get(i).and_then(|f| f.xyz)
+                                                {
+                                                    pending_selection =
+                                                        Some((id.clone(), xyz));
+                                                }
+                                            }
+                                        } else {
+                                            ui.label("Waiting for frames…");
                                         }
-                                    }
-                                } else {
-                                    ui.label("Waiting for camera...");
+                                    });
                                 }
                             });
-
-                            if show_ir {
-                                ui.separator();
-                            }
-                        }
-
-                        if show_ir {
-                            ui.vertical(|ui| {
-                                ui.label("IR + Face");
-                                if let Some(tex) = &self.ir_texture {
-                                    let aspect = self.ir_size[1] as f32 / self.ir_size[0] as f32;
-                                    let display_h = panel_width * aspect;
-                                    let display_size = egui::vec2(panel_width, display_h);
-
-                                    let (rect, _response) =
-                                        ui.allocate_exact_size(display_size, egui::Sense::hover());
-
-                                    ui.painter().image(
-                                        tex.id(),
-                                        rect,
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        egui::Color32::WHITE,
-                                    );
-
-                                    let scale_x = rect.width() / self.ir_size[0] as f32;
-                                    let scale_y = rect.height() / self.ir_size[1] as f32;
-                                    let clicked = overlay::draw_faces(
-                                        ui,
-                                        &self.latest_ir_faces,
-                                        rect.left_top(),
-                                        scale_x,
-                                        scale_y,
-                                        self.tracked_ir_idx,
-                                        "ir_face",
-                                    );
-                                    overlay::draw_roi(
-                                        ui.painter(),
-                                        self.roi_rect,
-                                        rect.left_top(),
-                                        scale_x,
-                                        scale_y,
-                                    );
-                                    if let Some(i) = clicked {
-                                        if let Some(xyz) = self
-                                            .latest_ir_faces
-                                            .get(i)
-                                            .and_then(|f| f.xyz)
-                                        {
-                                            ir_selection = Some(xyz);
-                                        }
-                                    }
-                                } else {
-                                    ui.label("Waiting for camera...");
-                                }
-                            });
+                            ui.add_space(gap);
                         }
                     });
             });
 
-        // If the user clicked a face box, forward the camera-frame XYZ to the server.
-        // IR takes precedence when both fire in the same frame (rare; only one panel
-        // is visible at a time given the current stream selection).
-        if let Some(xyz) = ir_selection.or(rgb_selection) {
-            self.send_select_person(xyz);
+        // If the user clicked a face box, forward the camera-frame XYZ (with
+        // the source camera id so the server can pick the right extrinsics).
+        if let Some((cam_id, xyz)) = pending_selection {
+            self.send_select_person(cam_id, xyz);
         }
 
         // ── 3D Scene window ───────────────────────────────────────
@@ -956,15 +1015,38 @@ impl eframe::App for App {
                     // ── Calibration side panel ────────────────────────────────
                     egui::SidePanel::right("calib_panel")
                         .resizable(false)
-                        .default_width(210.0)
+                        .default_width(220.0)
                         .show_inside(ui, |ui| {
                             ui.heading("Calibration");
-                            let cam_label = if self.camera_id.is_empty() {
-                                "…".to_string()
-                            } else {
-                                self.camera_id.clone()
+
+                            // Camera selector — drives which camera's extrinsics
+                            // and calibration points the rest of the panel acts on.
+                            let cam_ids: Vec<String> = self.cameras.keys().cloned().collect();
+                            if self.selected_calib_camera
+                                .as_ref()
+                                .map(|id| !self.cameras.contains_key(id))
+                                .unwrap_or(false)
+                            {
+                                self.selected_calib_camera = None;
+                            }
+                            if self.selected_calib_camera.is_none() {
+                                self.selected_calib_camera = cam_ids.first().cloned();
+                            }
+                            let selected_id = self.selected_calib_camera.clone();
+                            let selected_label = match &selected_id {
+                                Some(id) => id.clone(),
+                                None => "(no camera)".into(),
                             };
-                            ui.small(format!("Camera: {}", cam_label));
+                            egui::ComboBox::from_id_salt("calib_camera_select")
+                                .selected_text(selected_label)
+                                .show_ui(ui, |ui| {
+                                    for id in &cam_ids {
+                                        let sel = self.selected_calib_camera.as_ref() == Some(id);
+                                        if ui.selectable_label(sel, id).clicked() {
+                                            self.selected_calib_camera = Some(id.clone());
+                                        }
+                                    }
+                                });
 
                             // Scene camera driver — free orbit or a specific tracked person.
                             ui.separator();
@@ -1080,15 +1162,34 @@ impl eframe::App for App {
 
                             ui.separator();
 
-                            // Status
-                            if self.extrinsics.is_some() {
+                            // Everything below operates on the selected camera.
+                            // Skip gracefully when there are no cameras at all.
+                            let Some(sel_id) = selected_id.clone() else {
+                                ui.colored_label(
+                                    egui::Color32::from_gray(160),
+                                    "No cameras available",
+                                );
+                                return;
+                            };
+                            let has_extrinsics = self
+                                .cameras
+                                .get(&sel_id)
+                                .map(|v| v.extrinsics.is_some())
+                                .unwrap_or(false);
+                            let calib_points_len = self
+                                .cameras
+                                .get(&sel_id)
+                                .map(|v| v.calib_points.len())
+                                .unwrap_or(0);
+
+                            if has_extrinsics {
                                 ui.colored_label(egui::Color32::GREEN, "Extrinsics active");
                             } else {
                                 ui.colored_label(egui::Color32::from_gray(160), "Uncalibrated");
                             }
 
                             ui.add_space(4.0);
-                            ui.label(format!("{} pair(s) collected", self.calib_points.len()));
+                            ui.label(format!("{} pair(s) collected", calib_points_len));
 
                             ui.separator();
                             match self.calib_sub_mode {
@@ -1137,16 +1238,17 @@ impl eframe::App for App {
                                                 cam,
                                                 world: [wx, wy, wz],
                                             };
-                                            self.calib_points.push(pt);
+                                            if let Some(v) = self.cameras.get_mut(&sel_id) {
+                                                v.calib_points.push(pt);
+                                            }
                                             self.calib_pending_cam = None;
+                                            let url = format!("/api/cameras/{}/points", sel_id);
                                             wasm_bindgen_futures::spawn_local(async move {
-                                                let _ = gloo_net::http::Request::post(
-                                                    "/api/calibration/points",
-                                                )
-                                                .json(&pt)
-                                                .expect("serialize CalibrationPoint")
-                                                .send()
-                                                .await;
+                                                let _ = gloo_net::http::Request::post(&url)
+                                                    .json(&pt)
+                                                    .expect("serialize CalibrationPoint")
+                                                    .send()
+                                                    .await;
                                             });
                                         }
                                         if ui.small_button("Cancel").clicked() {
@@ -1160,8 +1262,14 @@ impl eframe::App for App {
                                     }
                                 }
                                 CalibrationMode::StandInView => {
-                                    let tracked = self.tracked_rgb_idx.is_some()
-                                        || self.tracked_ir_idx.is_some();
+                                    let tracked = self
+                                        .cameras
+                                        .get(&sel_id)
+                                        .map(|v| {
+                                            v.tracked_rgb_idx.is_some()
+                                                || v.tracked_ir_idx.is_some()
+                                        })
+                                        .unwrap_or(false);
                                     if tracked {
                                         ui.colored_label(egui::Color32::GREEN, "Tracked");
                                     } else {
@@ -1176,24 +1284,29 @@ impl eframe::App for App {
                                         .clicked()
                                     {
                                         let err_cell = self.calib_capture_error.clone();
-                                        let points_cell = self.points_pending.clone();
+                                        let points_cell = self
+                                            .cameras
+                                            .get(&sel_id)
+                                            .map(|v| v.points_pending.clone());
+                                        let capture_url = format!(
+                                            "/api/cameras/{}/calibration/capture_tracked",
+                                            sel_id
+                                        );
+                                        let points_url =
+                                            format!("/api/cameras/{}/points", sel_id);
                                         wasm_bindgen_futures::spawn_local(async move {
-                                            match gloo_net::http::Request::post(
-                                                "/api/calibration/capture_tracked",
-                                            )
-                                            .send()
-                                            .await
+                                            match gloo_net::http::Request::post(&capture_url)
+                                                .send()
+                                                .await
                                             {
                                                 Ok(resp) if resp.status() == 200 => {
                                                     *err_cell.borrow_mut() = None;
-                                                    // Re-fetch the canonical list from the server
-                                                    // so our in-memory mirror stays in sync.
-                                                    if let Ok(r) = gloo_net::http::Request::get(
-                                                        "/api/calibration/points",
-                                                    )
-                                                    .send()
-                                                    .await
-                                                    {
+                                                    if let (Some(points_cell), Ok(r)) = (
+                                                        points_cell,
+                                                        gloo_net::http::Request::get(&points_url)
+                                                            .send()
+                                                            .await,
+                                                    ) {
                                                         if let Ok(pts) = r
                                                             .json::<Vec<CalibrationPoint>>()
                                                             .await
@@ -1216,7 +1329,9 @@ impl eframe::App for App {
                                         });
                                     }
 
-                                    if let Some(msg) = self.calib_capture_error.borrow().as_ref() {
+                                    if let Some(msg) =
+                                        self.calib_capture_error.borrow().as_ref()
+                                    {
                                         ui.colored_label(
                                             egui::Color32::from_rgb(220, 90, 90),
                                             msg,
@@ -1231,51 +1346,58 @@ impl eframe::App for App {
 
                             ui.separator();
 
-                            let can_compute = self.calib_points.len() >= 3;
+                            let can_compute = calib_points_len >= 3;
                             if ui
                                 .add_enabled(can_compute, egui::Button::new("Compute extrinsics"))
                                 .clicked()
                             {
-                                let ext_pending = self.extrinsics_pending.clone();
+                                let ext_cell = self
+                                    .cameras
+                                    .get(&sel_id)
+                                    .map(|v| v.extrinsics_pending.clone());
+                                let url = format!(
+                                    "/api/cameras/{}/calibration/compute",
+                                    sel_id
+                                );
                                 wasm_bindgen_futures::spawn_local(async move {
                                     if let Ok(resp) =
-                                        gloo_net::http::Request::post("/api/calibration/compute")
-                                            .send()
-                                            .await
+                                        gloo_net::http::Request::post(&url).send().await
                                     {
                                         if let Ok(ext) =
                                             resp.json::<CameraExtrinsics>().await
                                         {
-                                            *ext_pending.borrow_mut() = Some(Some(ext));
+                                            if let Some(cell) = ext_cell {
+                                                *cell.borrow_mut() = Some(Some(ext));
+                                            }
                                         }
                                     }
                                 });
                             }
 
                             if ui.button("Clear pairs").clicked() {
-                                self.calib_points.clear();
+                                if let Some(v) = self.cameras.get_mut(&sel_id) {
+                                    v.calib_points.clear();
+                                }
                                 self.calib_pending_cam = None;
+                                let url = format!("/api/cameras/{}/points", sel_id);
                                 wasm_bindgen_futures::spawn_local(async move {
-                                    let _ = gloo_net::http::Request::delete(
-                                        "/api/calibration/points",
-                                    )
-                                    .send()
-                                    .await;
+                                    let _ = gloo_net::http::Request::delete(&url)
+                                        .send()
+                                        .await;
                                 });
                             }
 
-                            if self.extrinsics.is_some()
-                                && ui.button("Clear extrinsics").clicked()
-                            {
-                                self.extrinsics = None;
-                                self.manual_t = [0.0; 3];
-                                self.manual_euler_deg = [0.0; 3];
+                            if has_extrinsics && ui.button("Clear extrinsics").clicked() {
+                                if let Some(v) = self.cameras.get_mut(&sel_id) {
+                                    v.extrinsics = None;
+                                    v.manual_t = [0.0; 3];
+                                    v.manual_euler_deg = [0.0; 3];
+                                }
+                                let url = format!("/api/cameras/{}/extrinsics", sel_id);
                                 wasm_bindgen_futures::spawn_local(async move {
-                                    let _ = gloo_net::http::Request::delete(
-                                        "/api/calibration/extrinsics",
-                                    )
-                                    .send()
-                                    .await;
+                                    let _ = gloo_net::http::Request::delete(&url)
+                                        .send()
+                                        .await;
                                 });
                             }
 
@@ -1283,12 +1405,21 @@ impl eframe::App for App {
                             ui.separator();
                             ui.label("Manual adjust:");
 
-                            ui.label("Translation (m, Y+ up):");
                             let mut t_changed = false;
+                            let mut r_changed = false;
+                            let (manual_t, manual_euler_deg) = match self
+                                .cameras
+                                .get_mut(&sel_id)
+                            {
+                                Some(v) => (&mut v.manual_t, &mut v.manual_euler_deg),
+                                None => return,
+                            };
+
+                            ui.label("Translation (m, Y+ up):");
                             ui.horizontal(|ui| {
                                 t_changed |= ui
                                     .add(
-                                        egui::DragValue::new(&mut self.manual_t[0])
+                                        egui::DragValue::new(&mut manual_t[0])
                                             .speed(0.005)
                                             .prefix("X: ")
                                             .fixed_decimals(3),
@@ -1296,7 +1427,7 @@ impl eframe::App for App {
                                     .changed();
                                 t_changed |= ui
                                     .add(
-                                        egui::DragValue::new(&mut self.manual_t[1])
+                                        egui::DragValue::new(&mut manual_t[1])
                                             .speed(0.005)
                                             .prefix("Y: ")
                                             .fixed_decimals(3),
@@ -1304,7 +1435,7 @@ impl eframe::App for App {
                                     .changed();
                                 t_changed |= ui
                                     .add(
-                                        egui::DragValue::new(&mut self.manual_t[2])
+                                        egui::DragValue::new(&mut manual_t[2])
                                             .speed(0.005)
                                             .prefix("Z: ")
                                             .fixed_decimals(3),
@@ -1312,13 +1443,12 @@ impl eframe::App for App {
                                     .changed();
                             });
 
-                            let mut r_changed = false;
                             if self.calib_sub_mode == CalibrationMode::PickPoint {
                                 ui.label("Rotation (°):");
                                 ui.horizontal(|ui| {
                                     r_changed |= ui
                                         .add(
-                                            egui::DragValue::new(&mut self.manual_euler_deg[0])
+                                            egui::DragValue::new(&mut manual_euler_deg[0])
                                                 .speed(0.2)
                                                 .prefix("X: ")
                                                 .fixed_decimals(1),
@@ -1326,7 +1456,7 @@ impl eframe::App for App {
                                         .changed();
                                     r_changed |= ui
                                         .add(
-                                            egui::DragValue::new(&mut self.manual_euler_deg[1])
+                                            egui::DragValue::new(&mut manual_euler_deg[1])
                                                 .speed(0.2)
                                                 .prefix("Y: ")
                                                 .fixed_decimals(1),
@@ -1334,7 +1464,7 @@ impl eframe::App for App {
                                         .changed();
                                     r_changed |= ui
                                         .add(
-                                            egui::DragValue::new(&mut self.manual_euler_deg[2])
+                                            egui::DragValue::new(&mut manual_euler_deg[2])
                                                 .speed(0.2)
                                                 .prefix("Z: ")
                                                 .fixed_decimals(1),
@@ -1345,20 +1475,22 @@ impl eframe::App for App {
 
                             if t_changed || r_changed {
                                 let r = euler_to_rotation(
-                                    self.manual_euler_deg[0],
-                                    self.manual_euler_deg[1],
-                                    self.manual_euler_deg[2],
+                                    manual_euler_deg[0],
+                                    manual_euler_deg[1],
+                                    manual_euler_deg[2],
                                 );
-                                let new_ext = CameraExtrinsics { r, t: self.manual_t };
-                                self.extrinsics = Some(new_ext);
+                                let t = *manual_t;
+                                let new_ext = CameraExtrinsics { r, t };
+                                if let Some(v) = self.cameras.get_mut(&sel_id) {
+                                    v.extrinsics = Some(new_ext);
+                                }
+                                let url = format!("/api/cameras/{}/extrinsics", sel_id);
                                 wasm_bindgen_futures::spawn_local(async move {
-                                    let _ = gloo_net::http::Request::put(
-                                        "/api/calibration/extrinsics",
-                                    )
-                                    .json(&new_ext)
-                                    .expect("serialize CameraExtrinsics")
-                                    .send()
-                                    .await;
+                                    let _ = gloo_net::http::Request::put(&url)
+                                        .json(&new_ext)
+                                        .expect("serialize CameraExtrinsics")
+                                        .send()
+                                        .await;
                                 });
                             }
                         });
@@ -1600,17 +1732,20 @@ impl eframe::App for App {
                         }
                     }
 
-                    // Camera position, orientation axes, and frustum — always shown.
-                    // When no extrinsics: camera sits at origin and camera frame equals world frame.
+                    // Camera positions, orientation axes, and frustums — one set per active
+                    // camera. Uncalibrated cameras pile at the origin with identity orientation.
                     let identity_ext = CameraExtrinsics {
                         r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                         t: [0.0, 0.0, 0.0],
                     };
-                    let ext = self.extrinsics.unwrap_or(identity_ext);
-                    let [tx, ty, tz] = ext.t;
-                    if let Some(origin_px) = project(tx, ty, tz) {
+                    for (cam_id, view) in &self.cameras {
+                        let has_ext = view.extrinsics.is_some();
+                        let ext = view.extrinsics.unwrap_or(identity_ext);
+                        let [tx, ty, tz] = ext.t;
+                        let Some(origin_px) = project(tx, ty, tz) else {
+                            continue;
+                        };
                         let axis_len: f32 = 0.3; // metres
-                        // Camera-local axis tips pushed through ext.apply land in world frame.
                         let axes: [([f32; 3], egui::Color32); 3] = [
                             ([axis_len, 0.0, 0.0], egui::Color32::from_rgb(255, 60, 60)), // X red
                             ([0.0, axis_len, 0.0], egui::Color32::from_rgb(60, 220, 60)), // Y green
@@ -1627,18 +1762,14 @@ impl eframe::App for App {
                         }
 
                         // Frustum — D435 at 640×480: fx≈615, fy≈615
-                        // tan(half_fov_h) = 320/615 ≈ 0.520
-                        // tan(half_fov_v) = 240/615 ≈ 0.390
-                        let frust_depth: f32 = 2.0; // metres to far plane
+                        let frust_depth: f32 = 2.0;
                         let hx = 0.520 * frust_depth;
                         let hy = 0.390 * frust_depth;
-                        // Corners in camera-local frame (X right, Y down, Z forward). ext.apply
-                        // lifts them into the Y-up world frame.
                         let corners_cam: [[f32; 3]; 4] = [
-                            [ hx,  hy, frust_depth], // bottom-right
-                            [ hx, -hy, frust_depth], // top-right
-                            [-hx, -hy, frust_depth], // top-left
-                            [-hx,  hy, frust_depth], // bottom-left
+                            [ hx,  hy, frust_depth],
+                            [ hx, -hy, frust_depth],
+                            [-hx, -hy, frust_depth],
+                            [-hx,  hy, frust_depth],
                         ];
                         let frust_color =
                             egui::Color32::from_rgba_unmultiplied(120, 190, 255, 90);
@@ -1650,13 +1781,11 @@ impl eframe::App for App {
                                 project(w[0], w[1], w[2])
                             })
                             .collect();
-                        // 4 rays: origin → corner
                         for &cp in &corners_px {
                             if let Some(cp) = cp {
                                 painter.line_segment([origin_px, cp], frust_stroke);
                             }
                         }
-                        // Far-plane rectangle: 0-1-2-3-0
                         for i in 0..4 {
                             if let (Some(a), Some(b)) =
                                 (corners_px[i], corners_px[(i + 1) % 4])
@@ -1665,17 +1794,17 @@ impl eframe::App for App {
                             }
                         }
 
-                        // Origin dot + label
-                        let cam_dot_color = if self.extrinsics.is_some() {
+                        let cam_dot_color = if has_ext {
                             egui::Color32::WHITE
                         } else {
                             egui::Color32::from_gray(180)
                         };
                         painter.circle_filled(origin_px, 5.0, cam_dot_color);
+                        let short_id: String = cam_id.chars().take(6).collect();
                         painter.text(
                             origin_px + egui::vec2(7.0, -7.0),
                             egui::Align2::LEFT_BOTTOM,
-                            "CAM",
+                            &short_id,
                             egui::FontId::monospace(9.0),
                             cam_dot_color,
                         );

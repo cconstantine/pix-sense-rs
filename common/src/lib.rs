@@ -59,6 +59,8 @@ impl Default for DetectionConfig {
 /// Metadata sent alongside JPEG-encoded frames over WebSocket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameMetadata {
+    /// RealSense serial of the camera this frame came from. Clients demux by this.
+    pub camera_id: String,
     pub rgb_faces: Vec<FaceDetection>,
     pub ir_faces: Vec<FaceDetection>,
     pub rgb_size: [u32; 2],
@@ -122,8 +124,9 @@ pub enum ClientMessage {
     /// Update the active detection algorithm / stream.
     Config(DetectionConfig),
     /// Lock person tracking onto the person at this camera-frame XYZ.
-    /// The server applies extrinsics to get the world-frame target.
-    SelectPerson { xyz: [f32; 3] },
+    /// `camera_id` selects which camera's extrinsics to apply so the server can
+    /// convert to the world-frame target.
+    SelectPerson { camera_id: String, xyz: [f32; 3] },
     /// Drive the LED renderer from a simulated world-frame location.
     /// `Some(xyz)` sets/updates the override; `None` clears it and lets the
     /// real DB-driven tracking resume.

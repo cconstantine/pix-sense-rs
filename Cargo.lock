@@ -2649,6 +2649,7 @@ dependencies = [
  "gloo-net",
  "image",
  "pix-sense-common",
+ "serde",
  "serde_json",
  "tracing",
  "wasm-bindgen",

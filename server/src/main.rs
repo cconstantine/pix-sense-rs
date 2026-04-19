@@ -1,9 +1,11 @@
 mod camera;
 mod db;
 mod face;
+mod fusion;
 mod person_selector;
 mod renderer;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -25,16 +27,17 @@ use pix_sense_common::{
     ServerMessage, TrackingPoint,
 };
 use sqlx::{PgPool, Row as _};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tower_http::services::ServeDir;
 
 use prometheus::{
-    register_gauge_vec, register_histogram, register_histogram_vec, register_int_counter,
-    Encoder, GaugeVec, Histogram, HistogramVec, IntCounter, TextEncoder,
+    register_gauge_vec, register_histogram_vec, register_int_counter_vec,
+    Encoder, GaugeVec, HistogramVec, IntCounterVec, TextEncoder,
 };
 
-use camera::{Camera, CameraIntrinsics};
+use camera::{Camera, CameraIntrinsics, EnumeratedDevice};
 use face::{FaceDetector, HeadDetector};
+use fusion::{CameraDetections, FusionItem, TrackHint};
 
 const SCRFD_MODEL_PATH: &str = "models/scrfd_10g_bnkps.onnx";
 const YOLO_HEAD_MODEL_PATH: &str = "models/yolov8n_head.onnx";
@@ -46,9 +49,9 @@ const YOLO_HEAD_MODEL_PATH: &str = "models/yolov8n_head.onnx";
 const TIMING_BUCKETS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0];
 
 struct Metrics {
-    frame_count: IntCounter,
-    frame_time_ms: Histogram,
-    capture_time_ms: Histogram,
+    frame_count: IntCounterVec,
+    frame_time_ms: HistogramVec,
+    capture_time_ms: HistogramVec,
     pipeline_ms: HistogramVec,
     heads_detected: GaugeVec,
 }
@@ -59,41 +62,43 @@ impl Metrics {
             prometheus::HistogramOpts::new(name, help).buckets(TIMING_BUCKETS.to_vec())
         };
         Self {
-            frame_count: register_int_counter!(
+            frame_count: register_int_counter_vec!(
                 "pix_frame_count_total",
-                "Total number of frames processed"
+                "Total number of frames processed",
+                &["camera_id"]
             )
             .unwrap(),
-            frame_time_ms: register_histogram!(opts(
-                "pix_frame_time_ms",
-                "Total frame processing time in milliseconds"
-            ))
+            frame_time_ms: register_histogram_vec!(
+                opts("pix_frame_time_ms", "Total frame processing time in milliseconds"),
+                &["camera_id"]
+            )
             .unwrap(),
-            capture_time_ms: register_histogram!(opts(
-                "pix_capture_time_ms",
-                "Camera capture time in milliseconds"
-            ))
+            capture_time_ms: register_histogram_vec!(
+                opts("pix_capture_time_ms", "Camera capture time in milliseconds"),
+                &["camera_id"]
+            )
             .unwrap(),
             pipeline_ms: register_histogram_vec!(
                 opts(
                     "pix_pipeline_stage_ms",
                     "Pipeline stage duration in milliseconds"
                 ),
-                &["stream", "stage"]
+                &["camera_id", "stream", "stage"]
             )
             .unwrap(),
             heads_detected: register_gauge_vec!(
                 "pix_heads_detected",
                 "Number of heads detected per frame",
-                &["stream"]
+                &["camera_id", "stream"]
             )
             .unwrap(),
         }
     }
 }
 
-/// Data produced by the processing thread
+/// Data produced by a camera thread and consumed by its encoder thread.
 struct FrameData {
+    camera_id: String,
     rgb: RgbImage,
     ir: image::GrayImage,
     rgb_faces: Vec<FaceDetection>,
@@ -199,9 +204,25 @@ impl RoiTracker {
     }
 }
 
+/// Per-camera server-side state: extrinsics, session calibration points, and
+/// the most recent fusion hint (which carries both the tracked face indices
+/// and the (cam, world) XYZ pair that `capture_tracked` needs).
+#[derive(Clone)]
+struct CameraRuntime {
+    id: String,
+    name: String,
+    extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
+    calib_points: Arc<Mutex<Vec<CalibrationPoint>>>,
+    /// Latest fusion hint for this camera. `None` means fusion dropped the
+    /// track or this camera didn't contribute to the current pick.
+    track_hint_rx: watch::Receiver<Option<TrackHint>>,
+}
+
 #[derive(Clone)]
 struct AppState {
-    frame_rx: watch::Receiver<Arc<Vec<u8>>>,
+    /// Shared binary-frame fan-out. Each camera thread publishes; each WS
+    /// client subscribes once and forwards everything to the browser.
+    frame_tx: broadcast::Sender<Arc<Vec<u8>>>,
     config: Arc<RwLock<DetectionConfig>>,
     db_pool: Option<PgPool>,
     tracking_tx: broadcast::Sender<String>,
@@ -209,10 +230,8 @@ struct AppState {
     tracking_pos_tx: watch::Sender<Option<[f32; 3]>>,
     /// Latest LED color frame from the renderer, pre-serialised as JSON for WebSocket broadcast.
     led_colors_rx: watch::Receiver<Option<String>>,
-    /// Current camera extrinsics (applied to all depth detections). None = identity (camera at origin).
-    extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
-    /// Pending manual person-selection target (world frame). Drained by the processing
-    /// thread once per frame to override `PersonSelector`'s automatic pick.
+    /// Pending manual person-selection target (world frame). Drained by the
+    /// fusion task once per frame to override `PersonSelector`'s automatic pick.
     pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
     /// Virtual tracking override: when `Some`, the LED renderer is driven by this
     /// world-frame XYZ instead of the DB-streamed real tracking.
@@ -221,14 +240,9 @@ struct AppState {
     /// holds its last value — lets the operator freeze the LED state and
     /// orbit the scene camera to inspect from other angles.
     tracking_enabled: Arc<AtomicBool>,
-    /// Calibration point pairs collected in this session (in-memory, not persisted).
-    calib_points: Arc<Mutex<Vec<CalibrationPoint>>>,
-    /// Latest (cam-frame, world-frame) XYZ pair of the currently-tracked person.
-    /// Written by the processing thread each frame; read by the `capture_tracked`
-    /// calibration handler. `None` if no person is being tracked.
-    tracked_pair_rx: watch::Receiver<Option<([f32; 3], [f32; 3])>>,
-    /// RealSense serial number — used as the DB key for extrinsics.
-    camera_id: Arc<String>,
+    /// All active cameras, keyed by serial. Populated once at startup — the
+    /// server does not re-enumerate USB devices during runtime.
+    cameras: Arc<HashMap<String, CameraRuntime>>,
     /// Sculpture name from SCULPTURE_NAME env var — used for pattern activation.
     sculpture_name: Arc<String>,
 }
@@ -246,14 +260,22 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Query camera serial number before starting the full pipeline.
-    let camera_id = Arc::new(
-        camera::query_serial().unwrap_or_else(|| {
-            tracing::warn!("Could not read camera serial — using 'unknown' as camera_id");
-            "unknown".to_string()
-        })
-    );
-    tracing::info!("Camera serial: {}", camera_id);
+    // Enumerate all connected RealSense devices. Empty is OK — pattern editing
+    // and settings endpoints still work without any cameras.
+    let devices = match camera::enumerate() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("RealSense enumeration failed: {e:#} — continuing with no cameras");
+            Vec::new()
+        }
+    };
+    if devices.is_empty() {
+        tracing::warn!("No RealSense devices found — starting without camera threads");
+    } else {
+        for d in &devices {
+            tracing::info!("Camera detected: {} ({})", d.serial, d.name);
+        }
+    }
 
     // Connect to postgres (optional — runs without DB if DATABASE_URL is unset)
     let db_pool = db::connect().await;
@@ -271,8 +293,11 @@ async fn main() -> Result<()> {
     );
     let config = Arc::new(RwLock::new(initial_config));
 
-    // Watch channel for broadcasting the latest encoded frame to all WebSocket clients
-    let (frame_tx, frame_rx) = watch::channel(Arc::new(Vec::new()));
+    // Broadcast channel for fanning encoded frames out to all WS clients. The
+    // capacity needs to be large enough to absorb short client stalls without
+    // dropping an entire round of camera frames; a slow client sees `Lagged`
+    // and skips forward, it doesn't disconnect.
+    let (frame_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(128);
 
     // Unbounded channel for sending XYZ detections to the async DB writer task.
     // Unbounded so the sync detection thread never blocks on DB backpressure.
@@ -281,31 +306,49 @@ async fn main() -> Result<()> {
     // Broadcast channel for pushing tracking_location updates to WebSocket clients.
     let (tracking_tx, _) = broadcast::channel::<String>(16);
 
-    // Load extrinsics for this camera from DB; create and persist identity if none exist.
     let identity = CameraExtrinsics {
         r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         t: [0.0, 0.0, 0.0],
     };
-    let initial_extrinsics = if let Some(pool) = &db_pool {
-        if let Some(ext) = db::load_extrinsics(pool, &camera_id).await {
-            tracing::info!("Loaded extrinsics for camera {}: t={:?}", camera_id, ext.t);
-            ext
-        } else {
-            tracing::info!(
-                "No extrinsics stored for camera {} — saving identity as default",
-                camera_id
-            );
-            if let Err(e) = db::save_extrinsics(pool, &camera_id, &identity).await {
-                tracing::warn!("Failed to save default extrinsics: {e:#}");
-            }
-            identity
-        }
-    } else {
-        identity
-    };
-    let extrinsics = Arc::new(RwLock::new(Some(initial_extrinsics)));
 
-    let calib_points: Arc<Mutex<Vec<CalibrationPoint>>> = Arc::new(Mutex::new(Vec::new()));
+    // Build a CameraRuntime + per-camera channels for each enumerated device.
+    // Extrinsics come from the DB (identity is upserted for newly-seen cameras
+    // so the table always has a row to UPDATE from). `track_hint_tx` is owned
+    // by fusion; cameras read from their matching receiver.
+    let mut cameras: HashMap<String, CameraRuntime> = HashMap::new();
+    let mut hint_senders: HashMap<String, watch::Sender<Option<TrackHint>>> = HashMap::new();
+    let mut camera_bindings: Vec<(EnumeratedDevice, CameraRuntime, watch::Receiver<Option<TrackHint>>)> = Vec::new();
+    for dev in devices.iter() {
+        let ext = if let Some(pool) = &db_pool {
+            if let Some(ext) = db::load_extrinsics(pool, &dev.serial).await {
+                tracing::info!("Loaded extrinsics for camera {}: t={:?}", dev.serial, ext.t);
+                ext
+            } else {
+                tracing::info!(
+                    "No extrinsics stored for camera {} — saving identity as default",
+                    dev.serial
+                );
+                if let Err(e) = db::save_extrinsics(pool, &dev.serial, &identity).await {
+                    tracing::warn!("Failed to save default extrinsics: {e:#}");
+                }
+                identity
+            }
+        } else {
+            identity
+        };
+
+        let (hint_tx, hint_rx) = watch::channel::<Option<TrackHint>>(None);
+        let runtime = CameraRuntime {
+            id: dev.serial.clone(),
+            name: dev.name.clone(),
+            extrinsics: Arc::new(RwLock::new(Some(ext))),
+            calib_points: Arc::new(Mutex::new(Vec::new())),
+            track_hint_rx: hint_rx.clone(),
+        };
+        cameras.insert(dev.serial.clone(), runtime.clone());
+        hint_senders.insert(dev.serial.clone(), hint_tx);
+        camera_bindings.push((dev.clone(), runtime, hint_rx));
+    }
 
     let pending_selection: Arc<Mutex<Option<[f32; 3]>>> = Arc::new(Mutex::new(None));
 
@@ -319,34 +362,75 @@ async fn main() -> Result<()> {
 
     let metrics = Arc::new(Metrics::new());
 
-    // Watch channel for the currently-tracked person's (cam-frame, world-frame) XYZ
-    // pair. Written once per frame by the processing thread; read by the calibration
-    // `capture_tracked` HTTP handler. `None` means no person is being tracked.
-    let (tracked_pair_tx, tracked_pair_rx) =
-        watch::channel::<Option<([f32; 3], [f32; 3])>>(None);
-
     let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
-    let config_clone = config.clone();
-    let extrinsics_clone = extrinsics.clone();
-    let pending_selection_clone = pending_selection.clone();
-    let metrics_clone = metrics.clone();
 
-    // Spawn camera + face detection thread (blocking, runs on a std::thread)
-    let handle = std::thread::spawn(move || {
-        if let Err(e) = processing_thread(
-            frame_tx,
-            &running_clone,
-            config_clone,
-            db_tx,
-            extrinsics_clone,
-            pending_selection_clone,
-            tracked_pair_tx,
-            metrics_clone,
-        ) {
-            tracing::error!("Processing thread error: {:#}", e);
-        }
-    });
+    // Load detection models once on the main thread. TensorRT graph compile
+    // can take tens of seconds — sharing across camera threads via Mutex keeps
+    // VRAM flat on the Jetson, and the GPU serialises inference anyway so the
+    // Mutex contention is effectively free.
+    let head_detector = Arc::new(Mutex::new(if !camera_bindings.is_empty() {
+        tracing::info!("Loading YOLO head detection model...");
+        let d = HeadDetector::new(YOLO_HEAD_MODEL_PATH)?;
+        tracing::info!("YOLO head detector ready");
+        Some(d)
+    } else {
+        None
+    }));
+    let face_detector = Arc::new(Mutex::new(if !camera_bindings.is_empty() {
+        tracing::info!("Loading SCRFD face landmark model...");
+        let d = FaceDetector::new(SCRFD_MODEL_PATH)?;
+        tracing::info!("SCRFD face detector ready");
+        Some(d)
+    } else {
+        None
+    }));
+
+    // Fusion task receives per-camera detections, merges by world-frame
+    // proximity, runs the global PersonSelector, and sends TrackHint updates
+    // to each camera's watch channel. It also drains `pending_selection` and
+    // publishes the selected world XYZ to `db_tx`.
+    let (det_tx, det_rx) = mpsc::unbounded_channel::<CameraDetections>();
+    fusion::spawn(
+        det_rx,
+        hint_senders,
+        db_tx,
+        pending_selection.clone(),
+        running.clone(),
+    );
+
+    // Spawn one capture+detect thread per camera. Each owns its own `Camera`,
+    // `RoiTracker`, encoder, and lives for the server lifetime.
+    let mut camera_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    for (dev, runtime, hint_rx) in camera_bindings.into_iter() {
+        let running_c = running.clone();
+        let config_c = config.clone();
+        let det_tx_c = det_tx.clone();
+        let frame_tx_c = frame_tx.clone();
+        let metrics_c = metrics.clone();
+        let head_c = head_detector.clone();
+        let face_c = face_detector.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("camera-{}", runtime.id))
+            .spawn(move || {
+                if let Err(e) = camera_thread(
+                    dev,
+                    runtime,
+                    hint_rx,
+                    head_c,
+                    face_c,
+                    &running_c,
+                    config_c,
+                    det_tx_c,
+                    frame_tx_c,
+                    metrics_c,
+                ) {
+                    tracing::error!("Camera thread error: {:#}", e);
+                }
+            })
+            .expect("spawn camera thread");
+        camera_handles.push(handle);
+    }
+    drop(det_tx);
 
     // Spawn async task that drains the XYZ channel and writes to postgres
     if let Some(pool) = &db_pool {
@@ -396,41 +480,41 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState {
-        frame_rx,
+        frame_tx,
         config,
         db_pool,
         tracking_tx,
         tracking_pos_tx,
         led_colors_rx,
-        extrinsics,
         pending_selection,
         virtual_override,
         tracking_enabled,
-        calib_points,
-        tracked_pair_rx,
-        camera_id,
+        cameras: Arc::new(cameras),
         sculpture_name,
     };
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/leds", get(leds_handler))
-        .route("/api/calibration/camera_id", get(camera_id_handler))
+        .route("/api/cameras", get(list_cameras_handler))
         .route(
-            "/api/calibration/extrinsics",
+            "/api/cameras/{id}/extrinsics",
             get(get_extrinsics_handler)
                 .put(put_extrinsics_handler)
                 .delete(delete_extrinsics_handler),
         )
         .route(
-            "/api/calibration/points",
+            "/api/cameras/{id}/points",
             get(get_points_handler)
                 .post(add_point_handler)
                 .delete(clear_points_handler),
         )
-        .route("/api/calibration/compute", post(compute_extrinsics_handler))
         .route(
-            "/api/calibration/capture_tracked",
+            "/api/cameras/{id}/calibration/compute",
+            post(compute_extrinsics_handler),
+        )
+        .route(
+            "/api/cameras/{id}/calibration/capture_tracked",
             post(capture_tracked_handler),
         )
         // Pattern management
@@ -460,9 +544,11 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;
 
-    // Signal processing thread to stop
+    // Signal all camera threads to stop
     running.store(false, Ordering::Relaxed);
-    let _ = handle.join();
+    for handle in camera_handles {
+        let _ = handle.join();
+    }
 
     Ok(())
 }
@@ -473,15 +559,16 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     tracing::info!("New WebSocket connection");
     let tracking_rx = state.tracking_tx.subscribe();
+    let frame_rx = state.frame_tx.subscribe();
     ws.on_upgrade(|socket| {
         handle_ws(
             socket,
-            state.frame_rx,
+            frame_rx,
             state.config,
             tracking_rx,
             state.led_colors_rx,
             state.db_pool,
-            state.extrinsics,
+            state.cameras,
             state.pending_selection,
             state.virtual_override,
             state.tracking_enabled,
@@ -492,12 +579,12 @@ async fn ws_handler(
 
 async fn handle_ws(
     mut socket: WebSocket,
-    mut rx: watch::Receiver<Arc<Vec<u8>>>,
+    mut rx: broadcast::Receiver<Arc<Vec<u8>>>,
     config: Arc<RwLock<DetectionConfig>>,
     mut tracking_rx: broadcast::Receiver<String>,
     mut led_colors_rx: watch::Receiver<Option<String>>,
     db_pool: Option<PgPool>,
-    extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
+    cameras: Arc<HashMap<String, CameraRuntime>>,
     pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
     virtual_override: Arc<RwLock<Option<[f32; 3]>>>,
     tracking_enabled: Arc<AtomicBool>,
@@ -519,17 +606,23 @@ async fn handle_ws(
 
     loop {
         tokio::select! {
-            // New camera frame available — forward as binary
-            changed = rx.changed() => {
-                if changed.is_err() {
-                    break; // sender dropped
-                }
-                let frame = rx.borrow_and_update().clone();
-                if frame.is_empty() {
-                    continue;
-                }
-                if socket.send(Message::Binary((*frame).clone().into())).await.is_err() {
-                    break; // client disconnected
+            // New camera frame available — forward as binary. Any camera's frame
+            // may arrive; clients demux by `FrameMetadata.camera_id`.
+            frame = rx.recv() => {
+                match frame {
+                    Ok(bytes) => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if socket.send(Message::Binary((*bytes).clone().into())).await.is_err() {
+                            break; // client disconnected
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("WS client fell behind, dropped {n} frames");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             // Tracking location update from DB LISTEN — forward as JSON text
@@ -571,15 +664,20 @@ async fn handle_ws(
                                     });
                                 }
                             }
-                            Ok(ClientMessage::SelectPerson { xyz }) => {
-                                let world = extrinsics
+                            Ok(ClientMessage::SelectPerson { camera_id, xyz }) => {
+                                let Some(cam) = cameras.get(&camera_id) else {
+                                    tracing::warn!("SelectPerson for unknown camera {camera_id}");
+                                    continue;
+                                };
+                                let world = cam
+                                    .extrinsics
                                     .read()
                                     .unwrap()
                                     .as_ref()
                                     .map_or(xyz, |e| e.apply(xyz));
                                 *pending_selection.lock().unwrap() = Some(world);
                                 tracing::info!(
-                                    "Manual person selection: cam={:?} world={:?}",
+                                    "Manual person selection on {camera_id}: cam={:?} world={:?}",
                                     xyz, world
                                 );
                             }
@@ -716,109 +814,191 @@ async fn leds_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Calibration route handlers
+// Camera + calibration route handlers
 // ---------------------------------------------------------------------------
 
-/// GET /api/calibration/camera_id — returns the camera serial number as plain text.
-async fn camera_id_handler(State(state): State<AppState>) -> impl IntoResponse {
-    state.camera_id.as_ref().clone()
+/// GET /api/cameras — lists every camera the server opened at startup.
+async fn list_cameras_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut list: Vec<(String, String)> = state
+        .cameras
+        .values()
+        .map(|c| (c.id.clone(), c.name.clone()))
+        .collect();
+    // Stable ordering so the client grid doesn't reshuffle between requests.
+    list.sort_by(|a, b| a.0.cmp(&b.0));
+    Json(
+        list.into_iter()
+            .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
+            .collect::<Vec<_>>(),
+    )
 }
 
-/// GET /api/calibration/extrinsics — returns the current extrinsics as JSON, or 204 if none.
-async fn get_extrinsics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match *state.extrinsics.read().unwrap() {
+fn get_camera<'a>(
+    state: &'a AppState,
+    id: &str,
+) -> std::result::Result<&'a CameraRuntime, axum::response::Response> {
+    state.cameras.get(id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("Unknown camera: {id}") })),
+        )
+            .into_response()
+    })
+}
+
+/// GET /api/cameras/{id}/extrinsics — current extrinsics, 204 if none.
+async fn get_extrinsics_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let cam = match get_camera(&state, &id) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    match *cam.extrinsics.read().unwrap() {
         Some(ext) => Json(ext).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
-/// PUT /api/calibration/extrinsics — directly set extrinsics (e.g. from manual UI adjustment).
+/// PUT /api/cameras/{id}/extrinsics — directly set extrinsics (manual UI adjustment).
 async fn put_extrinsics_handler(
     State(state): State<AppState>,
+    Path(id): Path<String>,
     Json(ext): Json<CameraExtrinsics>,
 ) -> impl IntoResponse {
-    *state.extrinsics.write().unwrap() = Some(ext);
+    let cam = match get_camera(&state, &id) {
+        Ok(c) => c.clone(),
+        Err(r) => return r,
+    };
+    *cam.extrinsics.write().unwrap() = Some(ext);
     if let Some(pool) = &state.db_pool {
-        if let Err(e) = db::save_extrinsics(pool, &state.camera_id, &ext).await {
+        if let Err(e) = db::save_extrinsics(pool, &cam.id, &ext).await {
             tracing::warn!("Failed to persist extrinsics: {e:#}");
         }
     }
-    tracing::info!("Extrinsics updated for camera {}: t={:?}", state.camera_id, ext.t);
-    StatusCode::NO_CONTENT
+    tracing::info!("Extrinsics updated for camera {}: t={:?}", cam.id, ext.t);
+    StatusCode::NO_CONTENT.into_response()
 }
 
-/// DELETE /api/calibration/extrinsics — clears extrinsics from memory and DB.
-async fn delete_extrinsics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    *state.extrinsics.write().unwrap() = None;
+/// DELETE /api/cameras/{id}/extrinsics — clears extrinsics from memory and DB.
+async fn delete_extrinsics_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let cam = match get_camera(&state, &id) {
+        Ok(c) => c.clone(),
+        Err(r) => return r,
+    };
+    *cam.extrinsics.write().unwrap() = None;
     if let Some(pool) = &state.db_pool {
-        if let Err(e) = db::clear_extrinsics(pool, &state.camera_id).await {
+        if let Err(e) = db::clear_extrinsics(pool, &cam.id).await {
             tracing::warn!("Failed to clear extrinsics from DB: {e:#}");
         }
     }
-    tracing::info!("Extrinsics cleared for camera {}", state.camera_id);
-    StatusCode::NO_CONTENT
+    tracing::info!("Extrinsics cleared for camera {}", cam.id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
-/// GET /api/calibration/points — returns all accumulated calibration point pairs.
-async fn get_points_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let pts = state.calib_points.lock().unwrap().clone();
-    Json(pts)
+/// GET /api/cameras/{id}/points — all in-memory calibration point pairs.
+async fn get_points_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let cam = match get_camera(&state, &id) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    Json(cam.calib_points.lock().unwrap().clone()).into_response()
 }
 
-/// POST /api/calibration/points — appends a calibration point pair.
+/// POST /api/cameras/{id}/points — append a point pair.
 async fn add_point_handler(
     State(state): State<AppState>,
+    Path(id): Path<String>,
     Json(pt): Json<CalibrationPoint>,
 ) -> impl IntoResponse {
-    let mut pts = state.calib_points.lock().unwrap();
+    let cam = match get_camera(&state, &id) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let mut pts = cam.calib_points.lock().unwrap();
     pts.push(pt);
     let count = pts.len();
     tracing::info!(
-        "Calibration point added ({} total): cam={:?} world={:?}",
-        count, pt.cam, pt.world
+        "Calibration point added to {} ({} total): cam={:?} world={:?}",
+        cam.id, count, pt.cam, pt.world
     );
-    Json(serde_json::json!({ "count": count }))
+    Json(serde_json::json!({ "count": count })).into_response()
 }
 
-/// DELETE /api/calibration/points — clears all calibration point pairs.
-async fn clear_points_handler(State(state): State<AppState>) -> impl IntoResponse {
-    state.calib_points.lock().unwrap().clear();
-    tracing::info!("Calibration points cleared");
-    StatusCode::NO_CONTENT
+/// DELETE /api/cameras/{id}/points — clears the camera's point pair list.
+async fn clear_points_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let cam = match get_camera(&state, &id) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    cam.calib_points.lock().unwrap().clear();
+    tracing::info!("Calibration points cleared for {}", cam.id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
-/// POST /api/calibration/capture_tracked — snapshots the currently-tracked
-/// person's (cam-frame, world-frame) XYZ into a new calibration pair.
+/// POST /api/cameras/{id}/calibration/capture_tracked — snapshots the
+/// currently-tracked person's (cam-frame, world-frame) XYZ as recorded by
+/// *this* camera into a new calibration pair.
 ///
-/// Returns 409 if no person is currently being tracked. Used by the
-/// "stand-in-view" calibration flow where the operator physically stands at a
-/// known spot, aligns their tracked marker via the translation sliders, then
-/// captures. The returned `world` half reflects the current extrinsics.
-async fn capture_tracked_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let pair = *state.tracked_pair_rx.borrow();
-    let Some((cam, world)) = pair else {
+/// Returns 409 if no person is currently being tracked or if this camera did
+/// not contribute to the fused pick this round.
+async fn capture_tracked_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let cam = match get_camera(&state, &id) {
+        Ok(c) => c.clone(),
+        Err(r) => return r,
+    };
+    let hint = *cam.track_hint_rx.borrow();
+    let Some(h) = hint else {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "No person currently tracked" })),
         )
             .into_response();
     };
-    let pt = CalibrationPoint { cam, world };
-    let mut pts = state.calib_points.lock().unwrap();
+    if !h.contributed {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "This camera did not contribute to the current tracked person"
+            })),
+        )
+            .into_response();
+    }
+    let pt = CalibrationPoint { cam: h.cam_xyz, world: h.world_xyz };
+    let mut pts = cam.calib_points.lock().unwrap();
     pts.push(pt);
     let count = pts.len();
     tracing::info!(
-        "Calibration point captured from tracking ({} total): cam={:?} world={:?}",
-        count, cam, world
+        "Calibration point captured from tracking on {} ({} total): cam={:?} world={:?}",
+        cam.id, count, pt.cam, pt.world
     );
     Json(pt).into_response()
 }
 
-/// POST /api/calibration/compute — runs Umeyama SVD on the collected point pairs,
-/// saves the result to memory and DB, and returns the computed extrinsics as JSON.
-/// Returns 400 if fewer than 3 point pairs are available.
-async fn compute_extrinsics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let pts = state.calib_points.lock().unwrap().clone();
+/// POST /api/cameras/{id}/calibration/compute — Umeyama SVD on this camera's
+/// collected point pairs; persists and returns the resulting extrinsics.
+async fn compute_extrinsics_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let cam = match get_camera(&state, &id) {
+        Ok(c) => c.clone(),
+        Err(r) => return r,
+    };
+    let pts = cam.calib_points.lock().unwrap().clone();
     if pts.len() < 3 {
         return (
             StatusCode::BAD_REQUEST,
@@ -830,12 +1010,12 @@ async fn compute_extrinsics_handler(State(state): State<AppState>) -> impl IntoR
     match compute_rigid_transform(&pts) {
         Ok(ext) => {
             tracing::info!(
-                "Computed extrinsics from {} pairs: t={:?}",
-                pts.len(), ext.t
+                "Computed extrinsics for {} from {} pairs: t={:?}",
+                cam.id, pts.len(), ext.t
             );
-            *state.extrinsics.write().unwrap() = Some(ext);
+            *cam.extrinsics.write().unwrap() = Some(ext);
             if let Some(pool) = &state.db_pool {
-                if let Err(e) = db::save_extrinsics(pool, &state.camera_id, &ext).await {
+                if let Err(e) = db::save_extrinsics(pool, &cam.id, &ext).await {
                     tracing::warn!("Failed to persist extrinsics: {e:#}");
                 }
             }
@@ -1067,43 +1247,40 @@ async fn metrics_handler() -> impl IntoResponse {
     )
 }
 
-fn processing_thread(
-    tx: watch::Sender<Arc<Vec<u8>>>,
+fn camera_thread(
+    device: EnumeratedDevice,
+    runtime: CameraRuntime,
+    hint_rx: watch::Receiver<Option<TrackHint>>,
+    head_detector: Arc<Mutex<Option<HeadDetector>>>,
+    face_detector: Arc<Mutex<Option<FaceDetector>>>,
     running: &AtomicBool,
     config: Arc<RwLock<DetectionConfig>>,
-    db_tx: tokio::sync::mpsc::UnboundedSender<Vec<[f32; 3]>>,
-    extrinsics: Arc<RwLock<Option<CameraExtrinsics>>>,
-    pending_selection: Arc<Mutex<Option<[f32; 3]>>>,
-    tracked_pair_tx: watch::Sender<Option<([f32; 3], [f32; 3])>>,
+    det_tx: mpsc::UnboundedSender<CameraDetections>,
+    frame_tx: broadcast::Sender<Arc<Vec<u8>>>,
     metrics: Arc<Metrics>,
 ) -> Result<()> {
-    // Load models first — CUDA graph compilation can take a while,
-    // and the RealSense pipeline may stall if frames aren't consumed.
-    tracing::info!("Loading YOLO head detection model...");
-    let mut head_detector = HeadDetector::new(YOLO_HEAD_MODEL_PATH)?;
-    tracing::info!("YOLO head detector ready");
+    tracing::info!("Initializing camera {}...", runtime.id);
+    let mut camera = Camera::new(&device)?;
+    tracing::info!("Camera {} initialized", runtime.id);
 
-    tracing::info!("Loading SCRFD face landmark model...");
-    let mut face_detector = FaceDetector::new(SCRFD_MODEL_PATH)?;
-    tracing::info!("SCRFD face detector ready");
+    // Pipeline: this thread sends FrameData to its encoder thread via a
+    // bounded channel. Capacity 1 so we never buffer stale frames — detection
+    // blocks until the encoder consumes the previous one.
+    let (enc_in, enc_out) = std::sync::mpsc::sync_channel::<FrameData>(1);
 
-    tracing::info!("Initializing camera...");
-    let mut camera = Camera::new()?;
-    tracing::info!("Camera initialized");
-
-    // Pipeline: detection thread sends FrameData to encode thread via bounded channel.
-    // Capacity 1 so we never buffer stale frames — detection blocks until encode consumes.
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<FrameData>(1);
-
-    // Encode thread: JPEG-encodes frames (CPU/NEON) while detection uses GPU
     let encode_running = Arc::new(AtomicBool::new(true));
-    let encode_running_clone = encode_running.clone();
-    let encode_handle = std::thread::spawn(move || {
-        encode_thread(frame_rx, tx, &encode_running_clone);
-    });
+    let encode_running_c = encode_running.clone();
+    let frame_tx_c = frame_tx.clone();
+    let camera_id_for_log = runtime.id.clone();
+    let encode_handle = std::thread::Builder::new()
+        .name(format!("encode-{}", runtime.id))
+        .spawn(move || {
+            encode_thread(enc_out, frame_tx_c, &encode_running_c);
+        })
+        .expect("spawn encode thread");
 
     let mut roi_tracker = RoiTracker::new();
-    let mut person_selector = person_selector::PersonSelector::new();
+    let camera_id = runtime.id.clone();
 
     while running.load(Ordering::Relaxed) {
         let t_loop = std::time::Instant::now();
@@ -1113,7 +1290,7 @@ fn processing_thread(
             Ok(Some(f)) => f,
             Ok(None) => continue,
             Err(e) => {
-                tracing::warn!("Camera capture error: {:#}", e);
+                tracing::warn!("Camera {} capture error: {:#}", camera_id, e);
                 continue;
             }
         };
@@ -1123,13 +1300,16 @@ fn processing_thread(
 
         let roi_rect = roi_tracker.crop_rect(frames.rgb.width(), frames.rgb.height(), 640);
 
-        let (rgb_faces_raw, ir_faces_raw, timing) = run_detection(
-            &mut head_detector,
-            &mut face_detector,
-            &frames,
-            cfg,
-            roi_rect,
-        );
+        // Hold the detector locks only while running inference. The GPU
+        // serialises across threads anyway, so sharing via Mutex costs
+        // scheduling overhead rather than throughput.
+        let (rgb_faces_raw, ir_faces_raw, timing) = {
+            let mut head_guard = head_detector.lock().unwrap();
+            let mut face_guard = face_detector.lock().unwrap();
+            let head = head_guard.as_mut().expect("head detector initialised");
+            let face = face_guard.as_mut().expect("face detector initialised");
+            run_detection(head, face, &frames, cfg, roi_rect)
+        };
 
         // Attach XYZ coordinates to every detection
         let rgb_faces: Vec<_> = rgb_faces_raw
@@ -1160,51 +1340,51 @@ fn processing_thread(
             })
             .collect();
 
-        // Build indexed (cam-frame, world-frame) positions with source tracking so
-        // we can identify which face in which stream the PersonSelector picks, and
-        // so calibration's `capture_tracked` endpoint can read the cam-frame XYZ
-        // without a second lookup.
-        let face_refs: Vec<(bool, usize, [f32; 3], [f32; 3])> = {
-            let ext = extrinsics.read().unwrap();
-            let mut refs = Vec::new();
+        // Resolve cam-frame points to world frame using this camera's
+        // extrinsics. Uncalibrated cameras fall through with identity —
+        // their detections won't cluster with calibrated cameras' world-frame
+        // points, which surfaces as ghost tracks in the UI (intentional; it
+        // makes it obvious which camera still needs calibration).
+        let items: Vec<FusionItem> = {
+            let ext = runtime.extrinsics.read().unwrap();
+            let mut out = Vec::new();
             for (i, f) in rgb_faces.iter().enumerate() {
                 if let Some(p) = f.xyz {
-                    refs.push((true, i, p, ext.as_ref().map_or(p, |e| e.apply(p))));
+                    let w = ext.as_ref().map_or(p, |e| e.apply(p));
+                    out.push(FusionItem { is_rgb: true, face_idx: i, cam_xyz: p, world_xyz: w });
                 }
             }
             for (i, f) in ir_faces.iter().enumerate() {
                 if let Some(p) = f.xyz {
-                    refs.push((false, i, p, ext.as_ref().map_or(p, |e| e.apply(p))));
+                    let w = ext.as_ref().map_or(p, |e| e.apply(p));
+                    out.push(FusionItem { is_rgb: false, face_idx: i, cam_xyz: p, world_xyz: w });
                 }
             }
-            refs
+            out
         };
-        let world_xyzs: Vec<[f32; 3]> = face_refs.iter().map(|&(_, _, _, xyz)| xyz).collect();
 
-        // Apply any pending manual selection from the UI before the selector runs.
-        if let Some(target) = pending_selection.lock().unwrap().take() {
-            person_selector.lock_to(target);
+        // Send to fusion. Back-pressure is bounded by the fusion task
+        // immediately consuming each batch — the unbounded queue is there so
+        // this thread never blocks on async work.
+        if det_tx
+            .send(CameraDetections { camera_id: camera_id.clone(), items })
+            .is_err()
+        {
+            break; // fusion task exited
         }
 
-        let (tracked_rgb_idx, tracked_ir_idx) =
-            if let Some((sel_idx, selected)) = person_selector.select(&world_xyzs) {
-                let _ = db_tx.send(vec![selected]);
-                let (is_rgb, face_idx, cam, _) = face_refs[sel_idx];
-                let _ = tracked_pair_tx.send(Some((cam, selected)));
-                if is_rgb {
-                    (Some(face_idx), None)
-                } else {
-                    (None, Some(face_idx))
-                }
-            } else {
-                let _ = tracked_pair_tx.send(None);
-                (None, None)
-            };
+        // Read whatever fusion hint is currently published. This is (at worst)
+        // one fusion round behind — fine visually, and it's the only way to
+        // stamp tracked indices without blocking the capture loop on fusion.
+        let (tracked_rgb_idx, tracked_ir_idx) = match *hint_rx.borrow() {
+            Some(h) if h.contributed => (h.tracked_rgb_idx, h.tracked_ir_idx),
+            _ => (None, None),
+        };
 
         // Center the ROI on the tracked person so detection stays locked on
         // them across frames. Fall back to the highest-confidence face when
         // no one is locked yet, so the detector can still acquire faces
-        // before the PersonSelector has picked a target.
+        // before fusion has picked a target.
         let active_faces: &[FaceDetection] = match cfg.stream {
             StreamSelection::Rgb => &rgb_faces,
             StreamSelection::Ir => &ir_faces,
@@ -1223,6 +1403,7 @@ fn processing_thread(
         roi_tracker.update(roi_target);
 
         let data = FrameData {
+            camera_id: camera_id.clone(),
             rgb: frames.rgb,
             ir: frames.ir,
             rgb_faces,
@@ -1233,39 +1414,39 @@ fn processing_thread(
             tracked_ir_idx,
         };
 
-        if frame_tx.send(data).is_err() {
+        if enc_in.send(data).is_err() {
             break; // encode thread exited
         }
 
         let detect_ms = t_loop.elapsed().as_secs_f64() * 1000.0;
 
-        // Update Prometheus metrics
-        metrics.frame_count.inc();
-        metrics.frame_time_ms.observe(detect_ms);
-        metrics.capture_time_ms.observe(capture_ms);
+        let lbl = camera_id.as_str();
+        metrics.frame_count.with_label_values(&[lbl]).inc();
+        metrics.frame_time_ms.with_label_values(&[lbl]).observe(detect_ms);
+        metrics.capture_time_ms.with_label_values(&[lbl]).observe(capture_ms);
 
         if let Some(t) = &timing {
-            metrics.pipeline_ms.with_label_values(&["rgb", "pre"]).observe(t.rgb_pre_ms);
-            metrics.pipeline_ms.with_label_values(&["rgb", "infer"]).observe(t.rgb_infer_ms);
-            metrics.pipeline_ms.with_label_values(&["rgb", "post"]).observe(t.rgb_post_ms);
-            metrics.pipeline_ms.with_label_values(&["rgb", "scrfd"]).observe(t.rgb_scrfd_ms);
-            metrics.pipeline_ms.with_label_values(&["rgb", "total"]).observe(t.rgb_total_ms);
-            metrics.heads_detected.with_label_values(&["rgb"]).set(t.rgb_heads as f64);
+            metrics.pipeline_ms.with_label_values(&[lbl, "rgb", "pre"]).observe(t.rgb_pre_ms);
+            metrics.pipeline_ms.with_label_values(&[lbl, "rgb", "infer"]).observe(t.rgb_infer_ms);
+            metrics.pipeline_ms.with_label_values(&[lbl, "rgb", "post"]).observe(t.rgb_post_ms);
+            metrics.pipeline_ms.with_label_values(&[lbl, "rgb", "scrfd"]).observe(t.rgb_scrfd_ms);
+            metrics.pipeline_ms.with_label_values(&[lbl, "rgb", "total"]).observe(t.rgb_total_ms);
+            metrics.heads_detected.with_label_values(&[lbl, "rgb"]).set(t.rgb_heads as f64);
 
-            metrics.pipeline_ms.with_label_values(&["ir", "pre"]).observe(t.ir_pre_ms);
-            metrics.pipeline_ms.with_label_values(&["ir", "infer"]).observe(t.ir_infer_ms);
-            metrics.pipeline_ms.with_label_values(&["ir", "post"]).observe(t.ir_post_ms);
-            metrics.pipeline_ms.with_label_values(&["ir", "scrfd"]).observe(t.ir_scrfd_ms);
-            metrics.pipeline_ms.with_label_values(&["ir", "total"]).observe(t.ir_total_ms);
-            metrics.heads_detected.with_label_values(&["ir"]).set(t.ir_heads as f64);
+            metrics.pipeline_ms.with_label_values(&[lbl, "ir", "pre"]).observe(t.ir_pre_ms);
+            metrics.pipeline_ms.with_label_values(&[lbl, "ir", "infer"]).observe(t.ir_infer_ms);
+            metrics.pipeline_ms.with_label_values(&[lbl, "ir", "post"]).observe(t.ir_post_ms);
+            metrics.pipeline_ms.with_label_values(&[lbl, "ir", "scrfd"]).observe(t.ir_scrfd_ms);
+            metrics.pipeline_ms.with_label_values(&[lbl, "ir", "total"]).observe(t.ir_total_ms);
+            metrics.heads_detected.with_label_values(&[lbl, "ir"]).set(t.ir_heads as f64);
         }
     }
 
     encode_running.store(false, Ordering::Relaxed);
-    drop(frame_tx);
+    drop(enc_in);
     let _ = encode_handle.join();
 
-    tracing::info!("Processing thread shutting down");
+    tracing::info!("Camera thread {} shutting down", camera_id_for_log);
     Ok(())
 }
 
@@ -1592,7 +1773,7 @@ fn translate_detections(detections: &mut [FaceDetection], offset_x: f32, offset_
 
 fn encode_thread(
     rx: std::sync::mpsc::Receiver<FrameData>,
-    tx: watch::Sender<Arc<Vec<u8>>>,
+    tx: broadcast::Sender<Arc<Vec<u8>>>,
     running: &AtomicBool,
 ) {
     let mut compressor = match turbojpeg::Compressor::new() {
@@ -1611,6 +1792,8 @@ fn encode_thread(
         };
 
         let msg = encode_frame(&mut compressor, &data);
+        // `send` returns Err if there are no active receivers — that's fine,
+        // it just means no clients are connected right now.
         let _ = tx.send(Arc::new(msg));
     }
 }
@@ -1639,6 +1822,7 @@ fn encode_frame(compressor: &mut turbojpeg::Compressor, data: &FrameData) -> Vec
         .expect("JPEG encode failed");
 
     let metadata = FrameMetadata {
+        camera_id: data.camera_id.clone(),
         rgb_faces: data.rgb_faces.clone(),
         ir_faces: data.ir_faces.clone(),
         rgb_size: [data.rgb.width(), data.rgb.height()],
