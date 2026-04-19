@@ -11,8 +11,32 @@ services:
     ports:
       - "5432:5432"
 
+  prod:
+    build:
+      context: .
+      target: prod
+    container_name: pix-sense-prod
+    runtime: nvidia
+    restart: unless-stopped
+    ports:
+      - "80:3000"
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+      - ./models:/app/models
+      - /run/udev:/run/udev:ro
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      - DATABASE_URL=${DATABASE_URL:-postgres://pixpq:not_that_secret@db:5432/pixpq}
+      - SCULPTURE_NAME=${SCULPTURE_NAME:-pixo-16}
+    depends_on:
+      - db
+
   dev:
-    build: .
+    build:
+      context: .
+      target: dev
     container_name: pix-sense-dev
     runtime: nvidia
     ports:

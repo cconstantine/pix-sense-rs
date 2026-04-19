@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0
+FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0 AS deps
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -36,19 +36,30 @@ RUN git clone --depth 1 --branch v2.56.5 https://github.com/IntelRealSense/libre
     && ldconfig \
     && rm -rf /tmp/librealsense
 
-# Download the ONNX model if not present (runs at container start)
-# The model can't be baked into the image since /app is volume-mounted
+# Download ONNX models if not present (runs at container start)
+# Models are volume-mounted at /app/models so they persist across rebuilds
 COPY <<'EOF' /usr/local/bin/ensure-model.sh
 #!/bin/bash
-MODEL_PATH="/app/models/scrfd_10g_bnkps.onnx"
-if [ ! -f "$MODEL_PATH" ]; then
+mkdir -p /app/models
+
+SCRFD_PATH="/app/models/scrfd_10g_bnkps.onnx"
+if [ ! -f "$SCRFD_PATH" ]; then
     echo "Downloading SCRFD model..."
-    mkdir -p /app/models
-    curl -L -o "$MODEL_PATH" \
+    curl -L -o "$SCRFD_PATH" \
         "https://huggingface.co/DIAMONIK7777/antelopev2/resolve/main/scrfd_10g_bnkps.onnx"
-    echo "Model downloaded to $MODEL_PATH"
+    echo "SCRFD model downloaded to $SCRFD_PATH"
 else
-    echo "Model already present at $MODEL_PATH"
+    echo "SCRFD model already present at $SCRFD_PATH"
+fi
+
+YOLO_PATH="/app/models/yolov8n_head.onnx"
+if [ ! -f "$YOLO_PATH" ]; then
+    echo "Downloading YOLOv8n head model..."
+    curl -L -o "$YOLO_PATH" \
+        "https://huggingface.co/trysem/YOLOv8_head_detector/resolve/main/yolo-head-nano.onnx"
+    echo "YOLOv8n model downloaded to $YOLO_PATH"
+else
+    echo "YOLOv8n model already present at $YOLO_PATH"
 fi
 EOF
 RUN chmod +x /usr/local/bin/ensure-model.sh
@@ -70,6 +81,14 @@ RUN groupadd --gid $USER_GID dev \
     && echo "dev ALL=(root) NOPASSWD: /bin/chmod" > /etc/sudoers.d/dev-usb \
     && chmod 0440 /etc/sudoers.d/dev-usb
 
+WORKDIR /app
+RUN chown dev:dev /app
+EXPOSE 3000
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+
+FROM deps AS rust
+
 # Install Rust as the dev user
 USER dev
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -77,12 +96,33 @@ ENV PATH="/home/dev/.cargo/bin:${PATH}"
 
 # Add WASM target and install trunk for client builds
 RUN rustup target add wasm32-unknown-unknown \
-    && cargo install cargo-binstall \
+    && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
     && cargo binstall trunk
 
-WORKDIR /app
-EXPOSE 3000
+
+FROM rust AS builder
+
+COPY --chown=dev:dev . /app/
+RUN --mount=type=cache,uid=1000,gid=1000,target=/home/dev/.cargo/registry \
+    --mount=type=cache,uid=1000,gid=1000,target=/home/dev/.cargo/git \
+    --mount=type=cache,uid=1000,gid=1000,target=/app/target \
+    cd /app/client && trunk build --release
+RUN --mount=type=cache,uid=1000,gid=1000,target=/home/dev/.cargo/registry \
+    --mount=type=cache,uid=1000,gid=1000,target=/home/dev/.cargo/git \
+    --mount=type=cache,uid=1000,gid=1000,target=/app/target \
+    RUSTFLAGS="-C link-arg=-Wl,--allow-shlib-undefined" cargo build -p pix-sense-server --release \
+    && cp target/release/pix-sense-server /app/pix-sense-server
 
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+FROM deps AS prod
+
+COPY --from=builder /app/pix-sense-server /app/pix-sense-server
+COPY --from=builder /app/client/dist /app/client/dist
+COPY --from=builder /app/migrations /app/migrations
+
+CMD ["bash", "-c", "ensure-model.sh && /app/pix-sense-server"]
+
+
+FROM rust AS dev
+
 CMD ["bash"]
