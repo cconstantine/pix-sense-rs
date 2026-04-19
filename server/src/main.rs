@@ -1222,6 +1222,7 @@ async fn put_settings_handler(
     let clamped = SculptureSettings {
         brightness: settings.brightness.clamp(0.0, 4.0),
         gamma: settings.gamma.clamp(0.1, 5.0),
+        rotation_minutes: settings.rotation_minutes.clamp(0.0, 1440.0),
     };
     match db::update_sculpture_settings(pool, &state.sculpture_name, &clamped).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),

@@ -382,7 +382,7 @@ impl App {
             active_pattern_pending,
             pattern_editing: None,
             pattern_new_name: String::new(),
-            settings: SculptureSettings { brightness: 1.0, gamma: 2.2 },
+            settings: SculptureSettings { brightness: 1.0, gamma: 2.2, rotation_minutes: 0.0 },
             settings_pending,
             scene_renderer: cc.gl.as_ref().and_then(|gl| {
                 match SceneRenderer::new(gl) {
@@ -868,7 +868,12 @@ impl eframe::App for App {
                         .text("γ")
                         .fixed_decimals(2),
                 );
-                if b_resp.changed() || g_resp.changed() {
+                let r_resp = ui.add(
+                    egui::Slider::new(&mut self.settings.rotation_minutes, 0.0..=60.0)
+                        .text("rotate (min, 0 = off)")
+                        .fixed_decimals(1),
+                );
+                if b_resp.changed() || g_resp.changed() || r_resp.changed() {
                     self.push_settings();
                 }
             });

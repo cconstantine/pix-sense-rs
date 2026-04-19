@@ -198,6 +198,10 @@ pub struct PatternUpdate {
 pub struct SculptureSettings {
     pub brightness: f32,
     pub gamma: f32,
+    /// Interval between random auto-rotations of the active pattern, in minutes.
+    /// `0` disables rotation.
+    #[serde(default)]
+    pub rotation_minutes: f32,
 }
 
 pub fn encode_frame_message(

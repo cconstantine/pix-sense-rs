@@ -2680,6 +2680,7 @@ dependencies = [
  "nalgebra",
  "pix-sense-common",
  "prometheus",
+ "rand 0.8.5",
  "realsense-rust",
  "serde_json",
  "sqlx",

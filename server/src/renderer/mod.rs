@@ -7,10 +7,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::db;
 use pipeline::{RendererPipeline, FRAME_DURATION};
+
+/// Shared hot-reload state: (brightness, gamma, overscan, rotation_minutes).
+type RenderSettings = (f32, f32, bool, f32);
 
 /// Entry point called from `main.rs` on a dedicated `std::thread`.
 /// Never returns (loops until `running` is set to false).
@@ -48,32 +52,44 @@ fn run_inner(
         .build()?;
 
     // --- Load initial data from DB ---
-    let (leds_by_device, initial_glsl, brightness, gamma, overscan) = rt.block_on(async {
-        let leds_by_device = db::load_leds(pool).await;
+    let (leds_by_device, initial_name, initial_glsl, brightness, gamma, overscan, rotation_minutes) =
+        rt.block_on(async {
+            let leds_by_device = db::load_leds(pool).await;
 
-        let (glsl, brightness, gamma, overscan) = db::load_active_pattern(pool, sculpture_name)
-            .await
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    "No active pattern found for sculpture '{sculpture_name}' — using black"
-                );
-                // Minimal valid pattern: output black.
-                (
-                    "void main() { fragColor = vec4(0.0, 0.0, 0.0, 1.0); }".to_string(),
-                    1.0f32,
-                    2.2f32,
-                    true,
-                )
-            });
+            let active = db::load_active_pattern(pool, sculpture_name)
+                .await
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "No active pattern found for sculpture '{sculpture_name}' — using black"
+                    );
+                    // Minimal valid pattern: output black.
+                    db::ActivePattern {
+                        name: String::new(),
+                        glsl_code: "void main() { fragColor = vec4(0.0, 0.0, 0.0, 1.0); }"
+                            .to_string(),
+                        brightness: 1.0,
+                        gamma: 2.2,
+                        overscan: true,
+                        rotation_minutes: 0.0,
+                    }
+                });
 
-        tracing::info!(
-            "Renderer: {} FadeCandy device(s), {} total LED(s), pattern loaded",
-            leds_by_device.len(),
-            leds_by_device.iter().map(|(_, l)| l.len()).sum::<usize>(),
-        );
+            tracing::info!(
+                "Renderer: {} FadeCandy device(s), {} total LED(s), pattern loaded",
+                leds_by_device.len(),
+                leds_by_device.iter().map(|(_, l)| l.len()).sum::<usize>(),
+            );
 
-        anyhow::Ok((leds_by_device, glsl, brightness, gamma, overscan))
-    })?;
+            anyhow::Ok((
+                leds_by_device,
+                active.name,
+                active.glsl_code,
+                active.brightness,
+                active.gamma,
+                active.overscan,
+                active.rotation_minutes,
+            ))
+        })?;
 
     // Flatten all LEDs into one list for the VBO (order: device0 leds, device1 leds, …).
     let all_leds: Vec<[f32; 3]> = leds_by_device
@@ -84,9 +100,9 @@ fn run_inner(
     // --- Shared state for hot-reload ---
     let reload_flag = Arc::new(AtomicBool::new(false));
     let new_glsl: Arc<Mutex<String>> = Arc::new(Mutex::new(initial_glsl.clone()));
-    // (brightness, gamma, overscan)
-    let new_render_settings: Arc<Mutex<(f32, f32, bool)>> =
-        Arc::new(Mutex::new((brightness, gamma, overscan)));
+    let new_pattern_name: Arc<Mutex<String>> = Arc::new(Mutex::new(initial_name.clone()));
+    let new_render_settings: Arc<Mutex<RenderSettings>> =
+        Arc::new(Mutex::new((brightness, gamma, overscan, rotation_minutes)));
 
     // --- Spawn settings watcher task (async, on the local rt) ---
     {
@@ -94,11 +110,21 @@ fn run_inner(
         let sn = sculpture_name.to_string();
         let flag = reload_flag.clone();
         let glsl_shared = new_glsl.clone();
+        let name_shared = new_pattern_name.clone();
         let settings_shared = new_render_settings.clone();
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
 
         rt.spawn(async move {
-            settings_watcher(pool, sn, db_url, flag, glsl_shared, settings_shared).await;
+            settings_watcher(
+                pool,
+                sn,
+                db_url,
+                flag,
+                glsl_shared,
+                name_shared,
+                settings_shared,
+            )
+            .await;
         });
     }
 
@@ -122,15 +148,18 @@ fn run_inner(
     // --- Build GL pipeline ---
     let mut pipe = RendererPipeline::new(gl, &all_leds, &initial_glsl)?;
     let mut current_glsl = initial_glsl.clone();
+    let mut current_pattern_name = initial_name;
     let mut current_brightness = brightness;
     let mut current_gamma = gamma;
     let mut current_overscan = overscan;
+    let mut current_rotation_minutes = rotation_minutes;
+    let mut last_switch = Instant::now();
 
     tracing::info!("Renderer: GL pipeline initialised — entering frame loop");
 
     // --- Frame loop ---
     loop {
-        let t_start = std::time::Instant::now();
+        let t_start = Instant::now();
 
         if !running.load(Ordering::Relaxed) {
             break;
@@ -141,14 +170,52 @@ fn run_inner(
         // which visibly jerks the pattern on every brightness/gamma slider tick.
         if reload_flag.swap(false, Ordering::AcqRel) {
             let glsl = new_glsl.lock().unwrap().clone();
-            let (b, g, o) = *new_render_settings.lock().unwrap();
+            let name = new_pattern_name.lock().unwrap().clone();
+            let (b, g, o, r) = *new_render_settings.lock().unwrap();
             if glsl != current_glsl {
                 pipe.reload_pattern_shader(gl, &glsl);
                 current_glsl = glsl;
+                // Reset the auto-rotation clock: a manual pick (or our own
+                // auto-swap) should buy the new pattern a full interval on
+                // screen before we rotate again.
+                last_switch = Instant::now();
             }
+            current_pattern_name = name;
             current_brightness = b;
             current_gamma = g;
             current_overscan = o;
+            current_rotation_minutes = r;
+        }
+
+        // Auto-rotate the active pattern once the configured interval elapses.
+        // The actual shader swap happens via the normal NOTIFY → hot-reload path
+        // after `set_active_pattern` updates the DB row.
+        if current_rotation_minutes > 0.0 {
+            let interval = Duration::from_secs_f32(current_rotation_minutes * 60.0);
+            if last_switch.elapsed() >= interval {
+                rt.block_on(async {
+                    let patterns = db::list_patterns(pool).await;
+                    let candidates: Vec<&pix_sense_common::Pattern> = patterns
+                        .iter()
+                        .filter(|p| p.enabled && p.name != current_pattern_name)
+                        .collect();
+                    if candidates.is_empty() {
+                        return;
+                    }
+                    use rand::seq::SliceRandom;
+                    let picked = candidates.choose(&mut rand::thread_rng()).unwrap();
+                    if let Err(e) =
+                        db::set_active_pattern(pool, sculpture_name, &picked.name).await
+                    {
+                        tracing::warn!("auto-rotate: set_active_pattern failed: {e:#}");
+                    } else {
+                        tracing::info!("auto-rotate: switching to pattern '{}'", picked.name);
+                    }
+                });
+                // Reset regardless of outcome so we don't hammer on errors or
+                // on the zero-candidates case.
+                last_switch = Instant::now();
+            }
         }
 
         // Get latest tracked person position.
@@ -225,7 +292,8 @@ async fn settings_watcher(
     db_url: String,
     reload_flag: Arc<AtomicBool>,
     new_glsl: Arc<Mutex<String>>,
-    new_settings: Arc<Mutex<(f32, f32, bool)>>,
+    new_pattern_name: Arc<Mutex<String>>,
+    new_settings: Arc<Mutex<RenderSettings>>,
 ) {
     if db_url.is_empty() {
         return;
@@ -249,11 +317,15 @@ async fn settings_watcher(
     loop {
         match listener.recv().await {
             Ok(_) => {
-                if let Some((glsl, b, g, o)) =
-                    db::load_active_pattern(&pool, &sculpture_name).await
-                {
-                    *new_glsl.lock().unwrap() = glsl;
-                    *new_settings.lock().unwrap() = (b, g, o);
+                if let Some(active) = db::load_active_pattern(&pool, &sculpture_name).await {
+                    *new_glsl.lock().unwrap() = active.glsl_code;
+                    *new_pattern_name.lock().unwrap() = active.name;
+                    *new_settings.lock().unwrap() = (
+                        active.brightness,
+                        active.gamma,
+                        active.overscan,
+                        active.rotation_minutes,
+                    );
                     reload_flag.store(true, Ordering::Release);
                     tracing::info!("settings_watcher: pattern/settings change detected — flagging reload");
                 }

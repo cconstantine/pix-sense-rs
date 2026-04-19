@@ -196,15 +196,25 @@ pub async fn load_leds(pool: &PgPool) -> Vec<(String, Vec<[f32; 3]>)> {
     result
 }
 
-/// Load the active pattern GLSL code and display settings for the named sculpture.
-/// Returns `(glsl_code, brightness, gamma, overscan)` or `None` if no enabled
-/// active pattern is found.
+/// Active pattern + display settings for a sculpture, joined across the
+/// `sculpture_settings` and `patterns` tables.
+pub struct ActivePattern {
+    pub name: String,
+    pub glsl_code: String,
+    pub brightness: f32,
+    pub gamma: f32,
+    pub overscan: bool,
+    pub rotation_minutes: f32,
+}
+
+/// Load the active pattern and display settings for the named sculpture.
+/// Returns `None` if no enabled active pattern is found.
 pub async fn load_active_pattern(
     pool: &PgPool,
     sculpture_name: &str,
-) -> Option<(String, f32, f32, bool)> {
+) -> Option<ActivePattern> {
     let row = sqlx::query(
-        "SELECT p.glsl_code, p.overscan, s.brightness, s.gamma \
+        "SELECT p.name, p.glsl_code, p.overscan, s.brightness, s.gamma, s.rotation_minutes \
          FROM sculpture_settings s \
          JOIN patterns p ON p.name = s.active_pattern \
          WHERE s.name = $1 AND p.enabled = true",
@@ -214,12 +224,14 @@ pub async fn load_active_pattern(
     .await
     .ok()??;
 
-    Some((
-        row.get("glsl_code"),
-        row.get("brightness"),
-        row.get("gamma"),
-        row.get("overscan"),
-    ))
+    Some(ActivePattern {
+        name: row.get("name"),
+        glsl_code: row.get("glsl_code"),
+        brightness: row.get("brightness"),
+        gamma: row.get("gamma"),
+        overscan: row.get("overscan"),
+        rotation_minutes: row.get("rotation_minutes"),
+    })
 }
 
 /// Load the persisted detection config, or return `None` if the row is missing.
@@ -393,14 +405,17 @@ pub async fn get_sculpture_settings(
     pool: &PgPool,
     sculpture_name: &str,
 ) -> Option<SculptureSettings> {
-    let row = sqlx::query("SELECT brightness, gamma FROM sculpture_settings WHERE name = $1")
-        .bind(sculpture_name)
-        .fetch_optional(pool)
-        .await
-        .ok()??;
+    let row = sqlx::query(
+        "SELECT brightness, gamma, rotation_minutes FROM sculpture_settings WHERE name = $1",
+    )
+    .bind(sculpture_name)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
     Some(SculptureSettings {
         brightness: row.get("brightness"),
         gamma: row.get("gamma"),
+        rotation_minutes: row.get("rotation_minutes"),
     })
 }
 
@@ -413,11 +428,14 @@ pub async fn update_sculpture_settings(
     settings: &SculptureSettings,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE sculpture_settings SET brightness = $2, gamma = $3 WHERE name = $1",
+        "UPDATE sculpture_settings \
+         SET brightness = $2, gamma = $3, rotation_minutes = $4 \
+         WHERE name = $1",
     )
     .bind(sculpture_name)
     .bind(settings.brightness)
     .bind(settings.gamma)
+    .bind(settings.rotation_minutes)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
