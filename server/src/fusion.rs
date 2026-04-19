@@ -52,8 +52,13 @@ pub struct TrackHint {
     pub world_xyz: [f32; 3],
 }
 
-/// Greedy-NN threshold for matching a detection to an existing track.
-const NN_THRESHOLD_M: f32 = 0.5;
+/// Stable identifier assigned to a fused track on creation; survives every
+/// position update for that track and is the key the `PersonSelector` pins to.
+pub type TrackId = u64;
+
+/// Greedy one-to-one matching threshold. A detection within this distance of
+/// an existing track is treated as the same person.
+const NN_THRESHOLD_M: f32 = 0.25;
 /// A track is dropped if no camera has seen it for this long.
 const TRACK_EXPIRE: Duration = Duration::from_secs(1);
 /// EMA smoothing factor for track position updates (0 = hold, 1 = snap).
@@ -61,6 +66,7 @@ const EMA_ALPHA: f32 = 0.5;
 
 #[derive(Debug)]
 struct FusedTrack {
+    id: TrackId,
     world_pos: [f32; 3],
     last_seen: Instant,
     /// The newest contributor (by camera_id) from the most recent fusion round
@@ -83,6 +89,7 @@ pub fn spawn(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tracks: Vec<FusedTrack> = Vec::new();
+        let mut next_track_id: TrackId = 0;
         let mut selector = PersonSelector::new();
 
         while running.load(Ordering::Relaxed) {
@@ -100,56 +107,69 @@ pub fn spawn(
 
             // Step 1: update/create tracks from this camera's detections.
             //
-            // Matching is greedy NN against existing tracks. Detections that
-            // are farther than NN_THRESHOLD_M from every track seed a new
-            // track. Because we only see one camera per message, we clear just
-            // this camera's slot in every track's contributors map — other
-            // cameras' contributions persist until their own next message.
+            // Greedy one-to-one assignment: each track is claimed by at most
+            // one detection per round, and each detection claims at most one
+            // track. Pairs are taken in order of smallest distance so the most
+            // confident matches win. Detections farther than NN_THRESHOLD_M
+            // from every available track seed a new track. We clear just this
+            // camera's slot in every track's contributors map — other cameras'
+            // contributions persist until their own next message.
             let now = Instant::now();
 
             for t in tracks.iter_mut() {
                 t.contributors.remove(&det.camera_id);
             }
 
-            for item in det.items.iter() {
-                // Find the nearest existing track within threshold.
-                let mut best: Option<(usize, f32)> = None;
-                for (i, t) in tracks.iter().enumerate() {
+            let mut candidates: Vec<(usize, usize, f32)> = Vec::new();
+            for (di, item) in det.items.iter().enumerate() {
+                for (ti, t) in tracks.iter().enumerate() {
                     let d = distance(t.world_pos, item.world_xyz);
                     if d < NN_THRESHOLD_M {
-                        match best {
-                            Some((_, bd)) if bd <= d => {}
-                            _ => best = Some((i, d)),
-                        }
+                        candidates.push((di, ti, d));
                     }
                 }
+            }
+            candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
 
-                match best {
-                    Some((idx, _)) => {
-                        let t = &mut tracks[idx];
-                        t.world_pos = ema(t.world_pos, item.world_xyz, EMA_ALPHA);
-                        t.last_seen = now;
-                        t.contributors.insert(det.camera_id.clone(), *item);
-                    }
-                    None => {
-                        let mut contributors = HashMap::new();
-                        contributors.insert(det.camera_id.clone(), *item);
-                        tracks.push(FusedTrack {
-                            world_pos: item.world_xyz,
-                            last_seen: now,
-                            contributors,
-                        });
-                    }
+            let mut det_claimed = vec![false; det.items.len()];
+            let mut track_claimed = vec![false; tracks.len()];
+            for (di, ti, _) in candidates {
+                if det_claimed[di] || track_claimed[ti] {
+                    continue;
                 }
+                det_claimed[di] = true;
+                track_claimed[ti] = true;
+                let item = &det.items[di];
+                let t = &mut tracks[ti];
+                t.world_pos = ema(t.world_pos, item.world_xyz, EMA_ALPHA);
+                t.last_seen = now;
+                t.contributors.insert(det.camera_id.clone(), *item);
+            }
+
+            for (di, item) in det.items.iter().enumerate() {
+                if det_claimed[di] {
+                    continue;
+                }
+                let mut contributors = HashMap::new();
+                contributors.insert(det.camera_id.clone(), *item);
+                let id = next_track_id;
+                next_track_id += 1;
+                tracks.push(FusedTrack {
+                    id,
+                    world_pos: item.world_xyz,
+                    last_seen: now,
+                    contributors,
+                });
             }
 
             // Step 2: expire tracks not seen by anyone in TRACK_EXPIRE.
             tracks.retain(|t| now.duration_since(t.last_seen) < TRACK_EXPIRE);
 
-            // Step 3: run the global PersonSelector over the unified track
-            // positions. The selector preserves its ≥30 s lock and 0.5 m
-            // proximity semantics regardless of how many cameras contributed.
-            let unified: Vec<[f32; 3]> = tracks.iter().map(|t| t.world_pos).collect();
+            // Step 3: run the global PersonSelector over the unified tracks,
+            // identified by stable TrackId so the selector pins to the same
+            // person across position jitter and brief detection misses.
+            let unified: Vec<(TrackId, [f32; 3])> =
+                tracks.iter().map(|t| (t.id, t.world_pos)).collect();
             let picked = selector.select(&unified);
 
             // Step 4: fan out hints to all cameras.
