@@ -115,6 +115,24 @@ pub enum ServerMessage {
     Config(DetectionConfig),
 }
 
+/// Declares which view the client is currently rendering. The server uses
+/// this to skip work for data the client won't display — camera frames while
+/// the user is in Scene, LED colors / tracking while the user is in Cameras.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ViewSubscription {
+    /// Only the named camera's frames. No tracking / LedColors.
+    Camera { camera_id: String },
+    /// Tracking + LedColors. No camera frames.
+    Scene,
+}
+
+impl Default for ViewSubscription {
+    fn default() -> Self {
+        Self::Scene
+    }
+}
+
 /// Tagged text message sent from WebSocket clients to the server.
 /// Serialises as `{"type":"config","data":{...}}` or
 /// `{"type":"select_person","data":{"xyz":[x,y,z]}}`.
@@ -135,6 +153,8 @@ pub enum ClientMessage {
     /// server stops pushing new positions (from DB or virtual) to the renderer's
     /// watch channel, so the LEDs hold whatever state was last sent.
     TrackingEnabled(bool),
+    /// Client is now on this view — server skips pushes that aren't needed.
+    View(ViewSubscription),
 }
 
 /// Camera extrinsic transform: p_world = R * p_cam + t

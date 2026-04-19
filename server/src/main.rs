@@ -24,7 +24,7 @@ use image::RgbImage;
 use pix_sense_common::{
     encode_frame_message, CalibrationPoint, CameraExtrinsics, ClientMessage, DetectionConfig,
     FaceDetection, FrameMetadata, LedPoint, Pattern, PatternUpdate, SculptureSettings,
-    ServerMessage,
+    ServerMessage, ViewSubscription,
 };
 use sqlx::{PgPool, Row as _};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
@@ -220,9 +220,10 @@ struct CameraRuntime {
 
 #[derive(Clone)]
 struct AppState {
-    /// Shared binary-frame fan-out. Each camera thread publishes; each WS
-    /// client subscribes once and forwards everything to the browser.
-    frame_tx: broadcast::Sender<Arc<Vec<u8>>>,
+    /// Shared binary-frame fan-out. Each camera thread publishes `(camera_id,
+    /// bytes)`; each WS client subscribes once and forwards only frames for
+    /// the camera its current view is watching.
+    frame_tx: broadcast::Sender<(String, Arc<Vec<u8>>)>,
     config: Arc<RwLock<DetectionConfig>>,
     db_pool: Option<PgPool>,
     tracking_tx: broadcast::Sender<String>,
@@ -301,7 +302,7 @@ async fn main() -> Result<()> {
     // capacity needs to be large enough to absorb short client stalls without
     // dropping an entire round of camera frames; a slow client sees `Lagged`
     // and skips forward, it doesn't disconnect.
-    let (frame_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(128);
+    let (frame_tx, _) = broadcast::channel::<(String, Arc<Vec<u8>>)>(128);
 
     // Unbounded channel for sending XYZ detections to the async DB writer task.
     // Unbounded so the sync detection thread never blocks on DB backpressure.
@@ -601,7 +602,7 @@ async fn ws_handler(
 
 async fn handle_ws(
     mut socket: WebSocket,
-    mut rx: broadcast::Receiver<Arc<Vec<u8>>>,
+    mut rx: broadcast::Receiver<(String, Arc<Vec<u8>>)>,
     config: Arc<RwLock<DetectionConfig>>,
     mut tracking_rx: broadcast::Receiver<String>,
     mut led_colors_rx: watch::Receiver<Option<String>>,
@@ -612,6 +613,10 @@ async fn handle_ws(
     tracking_enabled: Arc<AtomicBool>,
     tracking_pos_tx: watch::Sender<Option<[f32; 3]>>,
 ) {
+    // Client's declared view. Default Scene so we don't blast JPEGs at a fresh
+    // client before it tells us otherwise; the client sends a `View` message
+    // right after connecting to correct this if it lands on the Cameras view.
+    let mut view = ViewSubscription::default();
     // Send the current detection config immediately so the client UI reflects
     // the persisted setting rather than its hard-coded default.
     // Copy out of the lock guard before awaiting (guard is !Send across await).
@@ -628,12 +633,19 @@ async fn handle_ws(
 
     loop {
         tokio::select! {
-            // New camera frame available — forward as binary. Any camera's frame
-            // may arrive; clients demux by `FrameMetadata.camera_id`.
+            // New camera frame available. Forward as binary only if the
+            // client's current view is watching this specific camera.
             frame = rx.recv() => {
                 match frame {
-                    Ok(bytes) => {
+                    Ok((cam_id, bytes)) => {
                         if bytes.is_empty() {
+                            continue;
+                        }
+                        let wants = matches!(
+                            &view,
+                            ViewSubscription::Camera { camera_id } if camera_id == &cam_id
+                        );
+                        if !wants {
                             continue;
                         }
                         if socket.send(Message::Binary((*bytes).clone().into())).await.is_err() {
@@ -647,8 +659,12 @@ async fn handle_ws(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            // Tracking location update from the DB writer task — forward as JSON text
+            // Tracking location update from the DB writer task — forward as JSON text.
+            // Only while the client is on the Scene view.
             Ok(json) = tracking_rx.recv() => {
+                if !matches!(view, ViewSubscription::Scene) {
+                    continue;
+                }
                 if socket.send(Message::Text(json.into())).await.is_err() {
                     break; // client disconnected
                 }
@@ -656,15 +672,19 @@ async fn handle_ws(
             // LED color update from renderer — forward as JSON text.
             // Guard disabled once the renderer sender is gone so this arm doesn't
             // spin-loop on a permanently-closed channel and starve the others.
+            // Only forwarded while the client is on the Scene view.
             changed = led_colors_rx.changed(), if !led_colors_closed => {
                 if changed.is_err() {
                     led_colors_closed = true; // renderer stopped; skip this arm hereafter
                 } else {
-                    // Clone out of the guard before awaiting (guard is not Send).
+                    // Always mark as seen so the watcher doesn't loop hot on a
+                    // stale change flag while we're in Cameras view.
                     let json = led_colors_rx.borrow_and_update().clone();
-                    if let Some(json) = json {
-                        if socket.send(Message::Text(json.into())).await.is_err() {
-                            break;
+                    if matches!(view, ViewSubscription::Scene) {
+                        if let Some(json) = json {
+                            if socket.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -723,6 +743,9 @@ async fn handle_ws(
                                 // Intentionally don't push on re-enable: the next
                                 // detection batch (or VirtualLocation message) will
                                 // refresh the renderer's input within a frame or two.
+                            }
+                            Ok(ClientMessage::View(sub)) => {
+                                view = sub;
                             }
                             Err(e) => {
                                 tracing::warn!("Unrecognised client message: {e}");
@@ -1215,7 +1238,7 @@ fn camera_thread(
     running: &AtomicBool,
     config: Arc<RwLock<DetectionConfig>>,
     det_tx: mpsc::UnboundedSender<CameraDetections>,
-    frame_tx: broadcast::Sender<Arc<Vec<u8>>>,
+    frame_tx: broadcast::Sender<(String, Arc<Vec<u8>>)>,
     metrics: Arc<Metrics>,
 ) -> Result<()> {
     tracing::info!("Initializing camera {}...", runtime.id);
@@ -1732,7 +1755,7 @@ fn translate_detections(detections: &mut [FaceDetection], offset_x: f32, offset_
 
 fn encode_thread(
     rx: std::sync::mpsc::Receiver<FrameData>,
-    tx: broadcast::Sender<Arc<Vec<u8>>>,
+    tx: broadcast::Sender<(String, Arc<Vec<u8>>)>,
     running: &AtomicBool,
 ) {
     let mut compressor = match turbojpeg::Compressor::new() {
@@ -1750,10 +1773,11 @@ fn encode_thread(
             Err(_) => break, // sender dropped
         };
 
+        let camera_id = data.camera_id.clone();
         let msg = encode_frame(&mut compressor, &data);
         // `send` returns Err if there are no active receivers — that's fine,
         // it just means no clients are connected right now.
-        let _ = tx.send(Arc::new(msg));
+        let _ = tx.send((camera_id, Arc::new(msg)));
     }
 }
 

@@ -6,7 +6,7 @@ use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 use pix_sense_common::{
     decode_frame_message, CalibrationPoint, CameraExtrinsics, ClientMessage, DetectionAlgo,
     DetectionConfig, FaceDetection, LedPoint, Pattern, PatternUpdate, SculptureSettings,
-    ServerMessage, StreamSelection, TrackingPoint,
+    ServerMessage, StreamSelection, TrackingPoint, ViewSubscription,
 };
 use scene3d::SceneRenderer;
 use serde::Deserialize;
@@ -69,6 +69,16 @@ void main() {\n\
     vec2 uv = gl_FragCoord.xy / resolution;\n\
     fragColor = vec4(uv, 0.5 + 0.5 * sin(time * 0.001), 1.0);\n\
 }\n";
+
+/// Which top-level view the user is currently looking at. The client tells
+/// the server via `ClientMessage::View` so only relevant data is streamed.
+#[derive(Clone, PartialEq, Eq)]
+enum ActiveView {
+    /// One camera's feed at a time. User picks which camera via a tab strip.
+    Cameras,
+    /// 3D scene + GLSL pattern editor in a combined layout.
+    ScenePatterns,
+}
 
 /// What drives the 3D scene's orbit camera.
 #[derive(Clone, PartialEq)]
@@ -204,10 +214,15 @@ struct App {
     /// When true, projection scale grows with `scene_zoom` so the sculpture
     /// stays roughly constant size on screen as the camera zooms.
     scene_constant_size: bool,
-    // Window visibility
-    show_cameras: bool,
-    show_scene: bool,
-    show_patterns: bool,
+    // View selection
+    /// Which top-level view is active. Drives both UI layout and the
+    /// `ClientMessage::View` subscription the server uses for fan-out filtering.
+    active_view: ActiveView,
+    /// Which camera the Cameras view is currently showing. None until the first
+    /// camera arrives, after which it auto-picks the first one.
+    selected_camera: Option<String>,
+    /// Last `ViewSubscription` we sent, so we only re-send on real changes.
+    last_view_sent: Option<ViewSubscription>,
     /// Which viewpoint the 3D scene's orbit camera is driven by.
     scene_lock: SceneLock,
     /// Where the LED renderer's tracking location comes from.
@@ -365,9 +380,9 @@ impl App {
             scene_pitch: 12.0_f32.to_radians(),
             scene_zoom: 2.4,
             scene_constant_size: false,
-            show_cameras: true,
-            show_scene: true,
-            show_patterns: true,
+            active_view: ActiveView::ScenePatterns,
+            selected_camera: None,
+            last_view_sent: None,
             scene_lock: SceneLock::Free,
             tracking_source: TrackingSource::DepthCamera,
             last_virtual_send: 0.0,
@@ -495,7 +510,6 @@ impl App {
             }
         }
 
-        self.fps_counter.tick();
     }
 
     /// Send the current local_config to the server as a JSON text message.
@@ -544,6 +558,34 @@ impl App {
         });
     }
 
+    /// Current view subscription implied by the local UI state. `None` when the
+    /// user is on the Cameras view but no camera has been picked yet (nothing
+    /// for the server to stream).
+    fn current_view_subscription(&self) -> Option<ViewSubscription> {
+        match self.active_view {
+            ActiveView::ScenePatterns => Some(ViewSubscription::Scene),
+            ActiveView::Cameras => self
+                .selected_camera
+                .clone()
+                .map(|camera_id| ViewSubscription::Camera { camera_id }),
+        }
+    }
+
+    /// Push the current view subscription to the server if it changed since
+    /// the last send. Safe to call every frame — it's idempotent.
+    fn sync_view_subscription(&mut self) {
+        let Some(sub) = self.current_view_subscription() else {
+            return;
+        };
+        if self.last_view_sent.as_ref() == Some(&sub) {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(&ClientMessage::View(sub.clone())) {
+            self.ws_sender.send(WsMessage::Text(json));
+            self.last_view_sent = Some(sub);
+        }
+    }
+
     /// Switch the active pattern, optimistically updating the local state.
     fn activate_pattern(&mut self, name: String) {
         self.active_pattern = name.clone();
@@ -556,6 +598,330 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Render the patterns list + GLSL editor into the provided UI. Extracted
+    /// from an earlier floating-window implementation so it can live in the
+    /// Scene+Patterns view's right side panel.
+    fn render_patterns_panel(&mut self, ui: &mut egui::Ui) {
+        // ── Collect deferred actions (avoids borrow conflicts) ─────
+        let mut select_idx: Option<usize> = None;
+        let mut create_new: Option<String> = None; // name for a brand-new draft
+        let mut delete_name: Option<String> = None;
+        let mut save_pattern: Option<Pattern> = None; // POST new
+        let mut save_update: Option<(String, PatternUpdate)> = None; // PUT existing
+        let mut activate_name: Option<String> = None;
+
+        // ── Left panel: pattern list ───────────────────────────────
+        egui::SidePanel::left("patterns_list")
+            .resizable(false)
+            .default_width(200.0)
+            .show_inside(ui, |ui| {
+                ui.heading("Patterns");
+                ui.separator();
+
+                let list_height = (ui.available_height() - 52.0).max(40.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("patterns_scroll")
+                    .max_height(list_height)
+                    .show(ui, |ui| {
+                        for (i, pattern) in self.patterns.iter().enumerate() {
+                            let is_active = pattern.name == self.active_pattern;
+                            let is_selected = self
+                                .pattern_editing
+                                .as_ref()
+                                .map(|d| d.original_name == pattern.name)
+                                .unwrap_or(false);
+
+                            ui.horizontal(|ui| {
+                                let dot_color = if is_active {
+                                    egui::Color32::from_rgb(80, 220, 100)
+                                } else {
+                                    egui::Color32::from_gray(55)
+                                };
+                                let dot = egui::Button::new(
+                                    egui::RichText::new("●").color(dot_color),
+                                )
+                                .frame(false);
+                                let can_activate = pattern.enabled && !is_active;
+                                let dot_resp = ui
+                                    .add_enabled(can_activate, dot)
+                                    .on_hover_text(if is_active {
+                                        "Active"
+                                    } else if pattern.enabled {
+                                        "Click to activate"
+                                    } else {
+                                        "Disabled"
+                                    });
+                                if dot_resp.clicked() {
+                                    activate_name = Some(pattern.name.clone());
+                                }
+
+                                let text_color = if !pattern.enabled {
+                                    egui::Color32::from_gray(110)
+                                } else if is_active {
+                                    egui::Color32::from_rgb(80, 220, 100)
+                                } else {
+                                    egui::Color32::WHITE
+                                };
+                                let label = egui::RichText::new(&pattern.name)
+                                    .color(text_color);
+                                if ui.selectable_label(is_selected, label).clicked() {
+                                    select_idx = Some(i);
+                                }
+                            });
+                        }
+                    });
+
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.pattern_new_name)
+                            .hint_text("new name…")
+                            .desired_width(110.0),
+                    );
+                    let can_create =
+                        is_valid_pattern_name(self.pattern_new_name.trim());
+                    if ui
+                        .add_enabled(can_create, egui::Button::new("New"))
+                        .clicked()
+                    {
+                        create_new =
+                            Some(self.pattern_new_name.trim().to_string());
+                    }
+                });
+            });
+
+        // ── Editor (remaining space) ───────────────────────────────
+        if let Some(ref mut draft) = self.pattern_editing {
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                if draft.is_new {
+                    let name_valid = is_valid_pattern_name(draft.name.trim());
+                    let te = egui::TextEdit::singleline(&mut draft.name)
+                        .desired_width(160.0);
+                    let resp = ui.add(te);
+                    if !name_valid && resp.lost_focus() {
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            "letters, digits, _ or - only",
+                        );
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(&draft.original_name)
+                            .strong()
+                            .monospace(),
+                    );
+                    if self.active_pattern == draft.original_name {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(80, 220, 100),
+                            "(active)",
+                        );
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut draft.enabled, "Enabled");
+                ui.checkbox(&mut draft.overscan, "Overscan");
+            });
+
+            ui.separator();
+            ui.label(
+                egui::RichText::new("GLSL Fragment Shader")
+                    .small()
+                    .color(egui::Color32::from_gray(160)),
+            );
+
+            let code_height = (ui.available_height() - 42.0).max(60.0);
+            egui::ScrollArea::vertical()
+                .id_salt("glsl_edit_scroll")
+                .max_height(code_height)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut draft.glsl)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(24),
+                    );
+                });
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                let save_label = if draft.is_new { "Create" } else { "Save" };
+                let can_save = if draft.is_new {
+                    is_valid_pattern_name(draft.name.trim())
+                } else {
+                    true
+                };
+                if ui.add_enabled(can_save, egui::Button::new(save_label)).clicked() {
+                    if draft.is_new {
+                        save_pattern = Some(Pattern {
+                            name: draft.name.trim().to_string(),
+                            glsl_code: draft.glsl.clone(),
+                            enabled: draft.enabled,
+                            overscan: draft.overscan,
+                        });
+                        draft.original_name = draft.name.trim().to_string();
+                        draft.is_new = false;
+                    } else {
+                        save_update = Some((
+                            draft.original_name.clone(),
+                            PatternUpdate {
+                                glsl_code: draft.glsl.clone(),
+                                enabled: draft.enabled,
+                                overscan: draft.overscan,
+                            },
+                        ));
+                    }
+                }
+
+                if !draft.is_new {
+                    let is_active = self.active_pattern == draft.original_name;
+                    if is_active {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(80, 220, 100),
+                            "● Active",
+                        );
+                    } else if ui.button("Activate").clicked() {
+                        activate_name = Some(draft.original_name.clone());
+                    }
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .button(
+                                    egui::RichText::new("Delete")
+                                        .color(egui::Color32::from_rgb(220, 80, 80)),
+                                )
+                                .clicked()
+                            {
+                                delete_name = Some(draft.original_name.clone());
+                            }
+                        },
+                    );
+                }
+            });
+        } else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(
+                    egui::RichText::new("Select a pattern or create a new one")
+                        .color(egui::Color32::from_gray(100)),
+                );
+            });
+        }
+
+        // ── Apply deferred actions ─────────────────────────────────
+        if let Some(i) = select_idx {
+            let p = &self.patterns[i];
+            self.pattern_editing = Some(PatternDraft {
+                original_name: p.name.clone(),
+                name: p.name.clone(),
+                glsl: p.glsl_code.clone(),
+                enabled: p.enabled,
+                overscan: p.overscan,
+                is_new: false,
+            });
+        }
+
+        if let Some(name) = create_new {
+            self.pattern_editing = Some(PatternDraft {
+                original_name: name.clone(),
+                name: name.clone(),
+                glsl: DEFAULT_PATTERN_GLSL.to_string(),
+                enabled: true,
+                overscan: false,
+                is_new: true,
+            });
+            self.pattern_new_name = String::new();
+        }
+
+        if let Some(name) = delete_name {
+            self.pattern_editing = None;
+            let pp = self.patterns_pending.clone();
+            let ap = self.active_pattern_pending.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let url = format!("/api/patterns/{}", name);
+                if let Ok(resp) = gloo_net::http::Request::delete(&url).send().await {
+                    if resp.status() == 204 {
+                        if let Ok(r) = gloo_net::http::Request::get("/api/patterns").send().await {
+                            if let Ok(list) = r.json::<Vec<Pattern>>().await {
+                                *pp.borrow_mut() = Some(list);
+                            }
+                        }
+                        if let Ok(r) = gloo_net::http::Request::get("/api/patterns/active").send().await {
+                            if r.status() == 200 {
+                                if let Ok(active) = r.text().await {
+                                    *ap.borrow_mut() = Some(active);
+                                }
+                            } else {
+                                *ap.borrow_mut() = Some(String::new());
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Some(pattern) = save_pattern {
+            let pp = self.patterns_pending.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(resp) = gloo_net::http::Request::post("/api/patterns")
+                    .json(&pattern)
+                    .expect("serialize Pattern")
+                    .send()
+                    .await
+                {
+                    if resp.status() == 201 || resp.status() == 200 {
+                        if let Ok(r) = gloo_net::http::Request::get("/api/patterns").send().await {
+                            if let Ok(list) = r.json::<Vec<Pattern>>().await {
+                                *pp.borrow_mut() = Some(list);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Some((name, update)) = save_update {
+            let pp = self.patterns_pending.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let url = format!("/api/patterns/{}", name);
+                if let Ok(resp) = gloo_net::http::Request::put(&url)
+                    .json(&update)
+                    .expect("serialize PatternUpdate")
+                    .send()
+                    .await
+                {
+                    if resp.status() == 204 {
+                        if let Ok(r) = gloo_net::http::Request::get("/api/patterns").send().await {
+                            if let Ok(list) = r.json::<Vec<Pattern>>().await {
+                                *pp.borrow_mut() = Some(list);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Some(name) = activate_name {
+            let ap = self.active_pattern_pending.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let url = format!("/api/patterns/{}/activate", name);
+                if let Ok(resp) = gloo_net::http::Request::post(&url).send().await {
+                    if resp.status() == 204 {
+                        *ap.borrow_mut() = Some(name);
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -604,28 +970,16 @@ fn stream_label(s: StreamSelection) -> &'static str {
 
 fn decode_jpeg_rgb(jpeg_data: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory_with_format(jpeg_data, image::ImageFormat::Jpeg).ok()?;
-    let rgb = img.to_rgb8();
-    let pixels: Vec<egui::Color32> = rgb
-        .pixels()
-        .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
-        .collect();
-    Some(egui::ColorImage {
-        size: [rgb.width() as usize, rgb.height() as usize],
-        pixels,
-    })
+    let rgb = img.into_rgb8();
+    let size = [rgb.width() as usize, rgb.height() as usize];
+    Some(egui::ColorImage::from_rgb(size, rgb.as_raw()))
 }
 
 fn decode_jpeg_gray(jpeg_data: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory_with_format(jpeg_data, image::ImageFormat::Jpeg).ok()?;
-    let gray = img.to_luma8();
-    let pixels: Vec<egui::Color32> = gray
-        .pixels()
-        .map(|p| egui::Color32::from_gray(p[0]))
-        .collect();
-    Some(egui::ColorImage {
-        size: [gray.width() as usize, gray.height() as usize],
-        pixels,
-    })
+    let gray = img.into_luma8();
+    let size = [gray.width() as usize, gray.height() as usize];
+    Some(egui::ColorImage::from_gray(size, gray.as_raw()))
 }
 
 
@@ -639,6 +993,11 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Tick the UI frame-rate counter. Measures egui redraw cadence — the
+        // single most useful number for judging whether the main thread is
+        // keeping up, regardless of which view is active.
+        self.fps_counter.tick();
+
         // Drain LED fetch result (arrives once after startup)
         if let Some(leds) = self.led_pending.borrow_mut().take() {
             self.leds = leds;
@@ -696,7 +1055,13 @@ impl eframe::App for App {
 
         while let Some(event) = self.ws_receiver.try_recv() {
             match event {
-                WsEvent::Opened => self.connected = true,
+                WsEvent::Opened => {
+                    self.connected = true;
+                    // Force a re-send of the view subscription after reconnect
+                    // so the server doesn't stick on its default `Scene` for a
+                    // client that landed on the Cameras view.
+                    self.last_view_sent = None;
+                }
                 WsEvent::Closed => self.connected = false,
                 WsEvent::Error(e) => {
                     tracing::warn!("WebSocket error: {}", e);
@@ -745,7 +1110,7 @@ impl eframe::App for App {
                     (acc.0 + v.latest_rgb_faces.len(), acc.1 + v.latest_ir_faces.len())
                 });
                 ui.label(format!(
-                    "{} | Cams: {} | FPS: {:.1} | RGB: {} | IR: {}",
+                    "{} | Cams: {} | UI: {:.1} fps | RGB: {} | IR: {}",
                     status,
                     self.cameras.len(),
                     self.fps_counter.fps,
@@ -819,14 +1184,21 @@ impl eframe::App for App {
             });
 
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.show_cameras, "Cameras");
-                ui.checkbox(&mut self.show_scene, "3D Scene");
-                ui.checkbox(&mut self.show_patterns, "Patterns");
+                ui.selectable_value(
+                    &mut self.active_view,
+                    ActiveView::Cameras,
+                    "Cameras",
+                );
+                ui.selectable_value(
+                    &mut self.active_view,
+                    ActiveView::ScenePatterns,
+                    "Scene + Patterns",
+                );
 
                 ui.separator();
 
                 // Quick pattern switcher — lets the user flip between patterns
-                // without opening the Patterns window.
+                // without opening the patterns panel.
                 ui.label("Pattern:");
                 let enabled_patterns: Vec<String> = self
                     .patterns
@@ -879,22 +1251,58 @@ impl eframe::App for App {
             });
         });
 
-        // Background panel (egui requires a CentralPanel)
-        egui::CentralPanel::default().show(ctx, |_ui| {});
+        // Before rendering the view layout, make sure `selected_camera` points
+        // at a live camera; auto-pick the first one on initial arrival / after
+        // a hot-unplug.
+        if self
+            .selected_camera
+            .as_ref()
+            .map(|id| !self.cameras.contains_key(id))
+            .unwrap_or(false)
+        {
+            self.selected_camera = None;
+        }
+        if self.selected_camera.is_none() {
+            self.selected_camera = self.cameras.keys().next().cloned();
+        }
 
-        // ── Cameras window ────────────────────────────────────────
-        // Grid layout: every active camera renders in its own cell containing
-        // the active stream (RGB xor IR, per global config). Click-to-select
-        // flows out of the closure via `pending_selection` so we can call
-        // `send_select_person` after the `open: &mut self.show_cameras` borrow
-        // is released.
+        // Click-to-select on a face box flows out of the render closure via
+        // `pending_selection` so we can call `send_select_person` after the
+        // closure releases its `&mut self` reborrow.
         let mut pending_selection: Option<(String, [f32; 3])> = None;
-        egui::Window::new("Cameras")
-            .default_size([700.0, 520.0])
-            .default_pos([10.0, 80.0])
-            .open(&mut self.show_cameras)
-            .show(ctx, |ui| {
-                if self.cameras.is_empty() {
+
+        // ── Cameras view ──────────────────────────────────────────
+        // Single camera at a time — user picks via the tab strip at the top.
+        // The server only streams frames for this camera, so switching cameras
+        // via `sync_view_subscription` cuts over the feed within a frame or two.
+        if matches!(self.active_view, ActiveView::Cameras) {
+            // Camera picker: one SelectableLabel per active camera.
+            egui::TopBottomPanel::top("camera_picker").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if self.cameras.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_gray(140),
+                            "Waiting for cameras…",
+                        );
+                        return;
+                    }
+                    let current = self.selected_camera.clone();
+                    for (id, view) in &self.cameras {
+                        let selected = current.as_ref() == Some(id);
+                        let label = if view.name.is_empty() {
+                            id.clone()
+                        } else {
+                            format!("{} ({})", view.name, id)
+                        };
+                        if ui.selectable_label(selected, label).clicked() && !selected {
+                            self.selected_camera = Some(id.clone());
+                        }
+                    }
+                });
+            });
+
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let Some(id) = self.selected_camera.clone() else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
                         ui.colored_label(
@@ -903,110 +1311,88 @@ impl eframe::App for App {
                         );
                     });
                     return;
-                }
-
+                };
                 let show_rgb = matches!(self.active_config.stream, StreamSelection::Rgb);
-                let n = self.cameras.len();
-                let cols = (n as f32).sqrt().ceil() as usize;
-                let cols = cols.max(1);
-                let available = ui.available_size();
-                let gap = 8.0_f32;
-                let cell_w = ((available.x - gap * (cols - 1) as f32) / cols as f32).max(120.0);
+                let Some(view) = self.cameras.get(&id) else {
+                    return;
+                };
+                let (tex_opt, size, faces, tracked_idx, salt_prefix) = if show_rgb {
+                    (
+                        view.rgb_texture.as_ref(),
+                        view.rgb_size,
+                        &view.latest_rgb_faces,
+                        view.tracked_rgb_idx,
+                        "rgb_face_",
+                    )
+                } else {
+                    (
+                        view.ir_texture.as_ref(),
+                        view.ir_size,
+                        &view.latest_ir_faces,
+                        view.tracked_ir_idx,
+                        "ir_face_",
+                    )
+                };
 
-                let cam_ids: Vec<String> = self.cameras.keys().cloned().collect();
-                egui::ScrollArea::vertical()
-                    .id_salt("cam_grid_scroll")
-                    .show(ui, |ui| {
-                        let mut iter = cam_ids.into_iter().peekable();
-                        while iter.peek().is_some() {
-                            ui.horizontal(|ui| {
-                                for _ in 0..cols {
-                                    let Some(id) = iter.next() else { break };
-                                    ui.vertical(|ui| {
-                                        ui.set_width(cell_w);
-                                        let Some(view) = self.cameras.get(&id) else {
-                                            return;
-                                        };
-                                        let label = if view.name.is_empty() {
-                                            id.clone()
-                                        } else {
-                                            format!("{} ({})", view.name, id)
-                                        };
-                                        ui.small(label);
-
-                                        let (tex_opt, size, faces, tracked_idx, salt_prefix) =
-                                            if show_rgb {
-                                                (
-                                                    view.rgb_texture.as_ref(),
-                                                    view.rgb_size,
-                                                    &view.latest_rgb_faces,
-                                                    view.tracked_rgb_idx,
-                                                    "rgb_face_",
-                                                )
-                                            } else {
-                                                (
-                                                    view.ir_texture.as_ref(),
-                                                    view.ir_size,
-                                                    &view.latest_ir_faces,
-                                                    view.tracked_ir_idx,
-                                                    "ir_face_",
-                                                )
-                                            };
-
-                                        if let Some(tex) = tex_opt {
-                                            let aspect = size[1] as f32 / size[0] as f32;
-                                            let display_h = cell_w * aspect;
-                                            let display_size = egui::vec2(cell_w, display_h);
-                                            let (rect, _) = ui.allocate_exact_size(
-                                                display_size,
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().image(
-                                                tex.id(),
-                                                rect,
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(0.0, 0.0),
-                                                    egui::pos2(1.0, 1.0),
-                                                ),
-                                                egui::Color32::WHITE,
-                                            );
-                                            let scale_x = rect.width() / size[0] as f32;
-                                            let scale_y = rect.height() / size[1] as f32;
-                                            let salt = format!("{salt_prefix}{id}");
-                                            let clicked = overlay::draw_faces(
-                                                ui,
-                                                faces,
-                                                rect.left_top(),
-                                                scale_x,
-                                                scale_y,
-                                                tracked_idx,
-                                                &salt,
-                                            );
-                                            overlay::draw_roi(
-                                                ui.painter(),
-                                                view.roi_rect,
-                                                rect.left_top(),
-                                                scale_x,
-                                                scale_y,
-                                            );
-                                            if let Some(i) = clicked {
-                                                if let Some(xyz) =
-                                                    faces.get(i).and_then(|f| f.xyz)
-                                                {
-                                                    pending_selection =
-                                                        Some((id.clone(), xyz));
-                                                }
-                                            }
-                                        } else {
-                                            ui.label("Waiting for frames…");
-                                        }
-                                    });
-                                }
-                            });
-                            ui.add_space(gap);
-                        }
+                let Some(tex) = tex_opt else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label("Waiting for frames…");
                     });
+                    return;
+                };
+
+                // Fit the image to the available area preserving aspect.
+                let avail = ui.available_size();
+                let aspect = size[1] as f32 / size[0] as f32;
+                let mut w = avail.x;
+                let mut h = w * aspect;
+                if h > avail.y {
+                    h = avail.y;
+                    w = h / aspect;
+                }
+                let display_size = egui::vec2(w.max(1.0), h.max(1.0));
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        display_size,
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().image(
+                        tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(1.0, 1.0),
+                        ),
+                        egui::Color32::WHITE,
+                    );
+                    let scale_x = rect.width() / size[0] as f32;
+                    let scale_y = rect.height() / size[1] as f32;
+                    let salt = format!("{salt_prefix}{id}");
+                    let clicked = overlay::draw_faces(
+                        ui,
+                        faces,
+                        rect.left_top(),
+                        scale_x,
+                        scale_y,
+                        tracked_idx,
+                        &salt,
+                    );
+                    overlay::draw_roi(
+                        ui.painter(),
+                        view.roi_rect,
+                        rect.left_top(),
+                        scale_x,
+                        scale_y,
+                    );
+                    if let Some(i) = clicked {
+                        if let Some(xyz) = faces.get(i).and_then(|f| f.xyz) {
+                            pending_selection = Some((id.clone(), xyz));
+                        }
+                    }
+                });
             });
+        }
 
         // If the user clicked a face box, forward the camera-frame XYZ (with
         // the source camera id so the server can pick the right extrinsics).
@@ -1014,20 +1400,25 @@ impl eframe::App for App {
             self.send_select_person(cam_id, xyz);
         }
 
-        // ── 3D Scene window ───────────────────────────────────────
-        // Virtual-location and tracking-enabled sends happen after the Window
-        // closure returns so the `&mut self.show_scene` borrow taken by `.open(...)`
-        // doesn't conflict with the `&mut self` the helpers need.
-        // Outer option = "has a send"; inner option = Some(xyz) to set, None to clear.
+        // ── Scene + Patterns view ─────────────────────────────────
+        // Outer option = "has a send"; inner option = Some(xyz) to set, None
+        // to clear. Virtual-location / tracking-enabled sends happen after the
+        // panel closures return so the `&mut self` reborrow inside each
+        // closure doesn't conflict with the `&mut self` the helpers need.
         let mut pending_virtual_send: Option<Option<[f32; 3]>> = None;
         let mut pending_tracking_enabled: Option<bool> = None;
 
-        egui::Window::new("3D Scene")
-            .default_size([600.0, 500.0])
-            .default_pos([660.0, 80.0])
-            .open(&mut self.show_scene)
-            .vscroll(false)
-            .show(ctx, |ui| {
+        if matches!(self.active_view, ActiveView::ScenePatterns) {
+            // Patterns SidePanel first so egui reserves its width before the
+            // CentralPanel claims the remaining space.
+            egui::SidePanel::right("patterns_panel")
+                .default_width(420.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    self.render_patterns_panel(ui);
+                });
+
+            egui::CentralPanel::default().show(ctx, |ui| {
                     // ── Calibration side panel ────────────────────────────────
                     egui::SidePanel::right("calib_panel")
                         .resizable(false)
@@ -1856,374 +2247,26 @@ impl eframe::App for App {
                     );
             });
 
-        // Drain the virtual-location and tracking-enabled sends deferred from
-        // inside the Scene window. Ordering matters on Off → non-Virtual: send
-        // enable=true *before* the virtual-clear so the freeze isn't lifted
-        // with a stale override still in place on the server.
-        if let Some(enabled) = pending_tracking_enabled {
-            self.send_tracking_enabled(enabled);
+            // Drain the virtual-location and tracking-enabled sends deferred
+            // from inside the Scene closure. Ordering matters on Off →
+            // non-Virtual: send enable=true *before* the virtual-clear so the
+            // freeze isn't lifted with a stale override still in place on the
+            // server.
+            if let Some(enabled) = pending_tracking_enabled {
+                self.send_tracking_enabled(enabled);
+            }
+            if let Some(xyz) = pending_virtual_send {
+                self.send_virtual_location(xyz);
+            }
         }
-        if let Some(xyz) = pending_virtual_send {
-            self.send_virtual_location(xyz);
-        }
 
-        // ── Patterns window ───────────────────────────────────────
-        egui::Window::new("Patterns")
-            .default_size([700.0, 500.0])
-            .default_pos([10.0, 490.0])
-            .open(&mut self.show_patterns)
-            .show(ctx, |ui| {
-                    // ── Collect deferred actions (avoids borrow conflicts) ─────
-                    let mut select_idx: Option<usize> = None;
-                    let mut create_new: Option<String> = None; // name for a brand-new draft
-                    let mut delete_name: Option<String> = None;
-                    let mut save_pattern: Option<Pattern> = None; // POST new
-                    let mut save_update: Option<(String, PatternUpdate)> = None; // PUT existing
-                    let mut activate_name: Option<String> = None;
+        // Keep the server's view of the current subscription in sync with the
+        // local UI state. Idempotent — only sends when the selection actually
+        // changed since the last call.
+        self.sync_view_subscription();
 
-                    // ── Left panel: pattern list ───────────────────────────────
-                    egui::SidePanel::left("patterns_list")
-                        .resizable(false)
-                        .default_width(200.0)
-                        .show_inside(ui, |ui| {
-                            ui.heading("Patterns");
-                            ui.separator();
-
-                            let list_height = (ui.available_height() - 52.0).max(40.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("patterns_scroll")
-                                .max_height(list_height)
-                                .show(ui, |ui| {
-                                    for (i, pattern) in self.patterns.iter().enumerate() {
-                                        let is_active = pattern.name == self.active_pattern;
-                                        let is_selected = self
-                                            .pattern_editing
-                                            .as_ref()
-                                            .map(|d| d.original_name == pattern.name)
-                                            .unwrap_or(false);
-
-                                        ui.horizontal(|ui| {
-                                            // Active indicator dot doubles as a one-click
-                                            // activate button for inactive enabled patterns.
-                                            let dot_color = if is_active {
-                                                egui::Color32::from_rgb(80, 220, 100)
-                                            } else {
-                                                egui::Color32::from_gray(55)
-                                            };
-                                            let dot = egui::Button::new(
-                                                egui::RichText::new("●").color(dot_color),
-                                            )
-                                            .frame(false);
-                                            let can_activate = pattern.enabled && !is_active;
-                                            let dot_resp = ui
-                                                .add_enabled(can_activate, dot)
-                                                .on_hover_text(if is_active {
-                                                    "Active"
-                                                } else if pattern.enabled {
-                                                    "Click to activate"
-                                                } else {
-                                                    "Disabled"
-                                                });
-                                            if dot_resp.clicked() {
-                                                activate_name = Some(pattern.name.clone());
-                                            }
-
-                                            let text_color = if !pattern.enabled {
-                                                egui::Color32::from_gray(110)
-                                            } else if is_active {
-                                                egui::Color32::from_rgb(80, 220, 100)
-                                            } else {
-                                                egui::Color32::WHITE
-                                            };
-                                            let label = egui::RichText::new(&pattern.name)
-                                                .color(text_color);
-                                            if ui.selectable_label(is_selected, label).clicked() {
-                                                select_idx = Some(i);
-                                            }
-                                        });
-                                    }
-                                });
-
-                            ui.separator();
-
-                            // Create new pattern
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.pattern_new_name)
-                                        .hint_text("new name…")
-                                        .desired_width(110.0),
-                                );
-                                let can_create =
-                                    is_valid_pattern_name(self.pattern_new_name.trim());
-                                if ui
-                                    .add_enabled(can_create, egui::Button::new("New"))
-                                    .clicked()
-                                {
-                                    create_new =
-                                        Some(self.pattern_new_name.trim().to_string());
-                                }
-                            });
-                        });
-
-                    // ── Editor (remaining space) ───────────────────────────────
-                    if let Some(ref mut draft) = self.pattern_editing {
-                        ui.add_space(4.0);
-
-                        // Header row
-                        ui.horizontal(|ui| {
-                            ui.label("Name:");
-                            if draft.is_new {
-                                let name_valid = is_valid_pattern_name(draft.name.trim());
-                                let te = egui::TextEdit::singleline(&mut draft.name)
-                                    .desired_width(160.0);
-                                let resp = ui.add(te);
-                                if !name_valid && resp.lost_focus() {
-                                    ui.colored_label(
-                                        egui::Color32::RED,
-                                        "letters, digits, _ or - only",
-                                    );
-                                }
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(&draft.original_name)
-                                        .strong()
-                                        .monospace(),
-                                );
-                                if self.active_pattern == draft.original_name {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(80, 220, 100),
-                                        "(active)",
-                                    );
-                                }
-                            }
-                        });
-
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut draft.enabled, "Enabled");
-                            ui.checkbox(&mut draft.overscan, "Overscan");
-                        });
-
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("GLSL Fragment Shader")
-                                .small()
-                                .color(egui::Color32::from_gray(160)),
-                        );
-
-                        // Code editor — fills space above the button row
-                        let code_height = (ui.available_height() - 42.0).max(60.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("glsl_edit_scroll")
-                            .max_height(code_height)
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut draft.glsl)
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(24),
-                                );
-                            });
-
-                        ui.separator();
-
-                        // Action buttons
-                        ui.horizontal(|ui| {
-                            let save_label = if draft.is_new { "Create" } else { "Save" };
-                            let can_save = if draft.is_new {
-                                is_valid_pattern_name(draft.name.trim())
-                            } else {
-                                true
-                            };
-                            if ui.add_enabled(can_save, egui::Button::new(save_label)).clicked()
-                            {
-                                if draft.is_new {
-                                    save_pattern = Some(Pattern {
-                                        name: draft.name.trim().to_string(),
-                                        glsl_code: draft.glsl.clone(),
-                                        enabled: draft.enabled,
-                                        overscan: draft.overscan,
-                                    });
-                                    // Transition to edit mode for the just-created pattern.
-                                    draft.original_name = draft.name.trim().to_string();
-                                    draft.is_new = false;
-                                } else {
-                                    save_update = Some((
-                                        draft.original_name.clone(),
-                                        PatternUpdate {
-                                            glsl_code: draft.glsl.clone(),
-                                            enabled: draft.enabled,
-                                            overscan: draft.overscan,
-                                        },
-                                    ));
-                                }
-                            }
-
-                            if !draft.is_new {
-                                let is_active = self.active_pattern == draft.original_name;
-                                if is_active {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(80, 220, 100),
-                                        "● Active",
-                                    );
-                                } else if ui.button("Activate").clicked() {
-                                    activate_name = Some(draft.original_name.clone());
-                                }
-
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .button(
-                                                egui::RichText::new("Delete")
-                                                    .color(egui::Color32::from_rgb(220, 80, 80)),
-                                            )
-                                            .clicked()
-                                        {
-                                            delete_name =
-                                                Some(draft.original_name.clone());
-                                        }
-                                    },
-                                );
-                            }
-                        });
-                    } else {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(80.0);
-                            ui.label(
-                                egui::RichText::new("Select a pattern or create a new one")
-                                    .color(egui::Color32::from_gray(100)),
-                            );
-                        });
-                    }
-
-                    // ── Apply deferred actions ─────────────────────────────────
-                    if let Some(i) = select_idx {
-                        let p = &self.patterns[i];
-                        self.pattern_editing = Some(PatternDraft {
-                            original_name: p.name.clone(),
-                            name: p.name.clone(),
-                            glsl: p.glsl_code.clone(),
-                            enabled: p.enabled,
-                            overscan: p.overscan,
-                            is_new: false,
-                        });
-                    }
-
-                    if let Some(name) = create_new {
-                        self.pattern_editing = Some(PatternDraft {
-                            original_name: name.clone(),
-                            name: name.clone(),
-                            glsl: DEFAULT_PATTERN_GLSL.to_string(),
-                            enabled: true,
-                            overscan: false,
-                            is_new: true,
-                        });
-                        self.pattern_new_name = String::new();
-                    }
-
-                    if let Some(name) = delete_name {
-                        self.pattern_editing = None;
-                        let pp = self.patterns_pending.clone();
-                        let ap = self.active_pattern_pending.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let url = format!("/api/patterns/{}", name);
-                            if let Ok(resp) =
-                                gloo_net::http::Request::delete(&url).send().await
-                            {
-                                if resp.status() == 204 {
-                                    if let Ok(r) =
-                                        gloo_net::http::Request::get("/api/patterns")
-                                            .send()
-                                            .await
-                                    {
-                                        if let Ok(list) = r.json::<Vec<Pattern>>().await {
-                                            *pp.borrow_mut() = Some(list);
-                                        }
-                                    }
-                                    if let Ok(r) =
-                                        gloo_net::http::Request::get("/api/patterns/active")
-                                            .send()
-                                            .await
-                                    {
-                                        if r.status() == 200 {
-                                            if let Ok(active) = r.text().await {
-                                                *ap.borrow_mut() = Some(active);
-                                            }
-                                        } else {
-                                            *ap.borrow_mut() = Some(String::new());
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-
-                    if let Some(pattern) = save_pattern {
-                        let pp = self.patterns_pending.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Ok(resp) = gloo_net::http::Request::post("/api/patterns")
-                                .json(&pattern)
-                                .expect("serialize Pattern")
-                                .send()
-                                .await
-                            {
-                                if resp.status() == 201 || resp.status() == 200 {
-                                    if let Ok(r) =
-                                        gloo_net::http::Request::get("/api/patterns")
-                                            .send()
-                                            .await
-                                    {
-                                        if let Ok(list) = r.json::<Vec<Pattern>>().await {
-                                            *pp.borrow_mut() = Some(list);
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-
-                    if let Some((name, update)) = save_update {
-                        let pp = self.patterns_pending.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let url = format!("/api/patterns/{}", name);
-                            if let Ok(resp) = gloo_net::http::Request::put(&url)
-                                .json(&update)
-                                .expect("serialize PatternUpdate")
-                                .send()
-                                .await
-                            {
-                                if resp.status() == 204 {
-                                    if let Ok(r) =
-                                        gloo_net::http::Request::get("/api/patterns")
-                                            .send()
-                                            .await
-                                    {
-                                        if let Ok(list) = r.json::<Vec<Pattern>>().await {
-                                            *pp.borrow_mut() = Some(list);
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-
-                    if let Some(name) = activate_name {
-                        let ap = self.active_pattern_pending.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let url = format!("/api/patterns/{}/activate", name);
-                            if let Ok(resp) =
-                                gloo_net::http::Request::post(&url).send().await
-                            {
-                                if resp.status() == 204 {
-                                    *ap.borrow_mut() = Some(name);
-                                }
-                            }
-                        });
-                    }
-            });
-
-        // Repaint at ~30 fps (matches camera input rate; avoids rendering
-        // all three windows at 60 fps which is unnecessarily expensive).
+        // Repaint at ~30 fps (matches camera input rate; avoids rendering the
+        // active view at 60 fps unnecessarily).
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 }
