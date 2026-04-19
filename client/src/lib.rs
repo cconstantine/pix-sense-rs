@@ -463,23 +463,26 @@ impl App {
         view.tracked_rgb_idx = metadata.tracked_rgb_idx;
         view.tracked_ir_idx = metadata.tracked_ir_idx;
 
-        // Decode RGB JPEG. Texture names include the camera id so egui treats
-        // them as distinct entries in its texture cache.
-        if let Some(color_image) = decode_jpeg_rgb(rgb_jpeg) {
-            match &mut view.rgb_texture {
-                Some(tex) => tex.set(color_image, egui::TextureOptions::LINEAR),
-                None => {
-                    view.rgb_texture = Some(ctx.load_texture(
-                        format!("rgb_feed_{}", camera_id),
-                        color_image,
-                        egui::TextureOptions::LINEAR,
-                    ));
+        // JPEG decode + Color32 conversion dominates main-thread cost in WASM.
+        // The UI shows only one stream at a time, so skip the invisible one.
+        // Texture names include the camera id so egui treats them as distinct
+        // entries in its texture cache.
+        let show_rgb = matches!(metadata.active_config.stream, StreamSelection::Rgb);
+
+        if show_rgb {
+            if let Some(color_image) = decode_jpeg_rgb(rgb_jpeg) {
+                match &mut view.rgb_texture {
+                    Some(tex) => tex.set(color_image, egui::TextureOptions::LINEAR),
+                    None => {
+                        view.rgb_texture = Some(ctx.load_texture(
+                            format!("rgb_feed_{}", camera_id),
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
                 }
             }
-        }
-
-        // Decode IR JPEG (grayscale)
-        if let Some(color_image) = decode_jpeg_gray(ir_jpeg) {
+        } else if let Some(color_image) = decode_jpeg_gray(ir_jpeg) {
             match &mut view.ir_texture {
                 Some(tex) => tex.set(color_image, egui::TextureOptions::LINEAR),
                 None => {
@@ -682,7 +685,11 @@ impl eframe::App for App {
         // While the tab is hidden egui's rAF pauses but the WebSocket keeps
         // delivering; without this coalescing, the first update() after the tab
         // regains focus would synchronously JPEG-decode the entire backlog.
-        let mut latest_binary: Option<Vec<u8>> = None;
+        // Keep the latest frame *per camera*. With 3 cameras × 30 fps each,
+        // a single `Option<Vec<u8>>` would drop 2/3 of frames per egui tick
+        // since each camera's frame overwrites the previous — the UI would
+        // round-robin between cameras at ~10 fps each.
+        let mut latest_binary_by_cam: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut latest_tracking: Option<Vec<TrackingPoint>> = None;
         let mut latest_led_colors: Option<Vec<[u8; 3]>> = None;
         let mut latest_config: Option<DetectionConfig> = None;
@@ -696,7 +703,11 @@ impl eframe::App for App {
                     self.connected = false;
                 }
                 WsEvent::Message(WsMessage::Binary(data)) => {
-                    latest_binary = Some(data);
+                    let camera_id = decode_frame_message(&data)
+                        .map(|(_, _, m)| m.camera_id.clone());
+                    if let Some(id) = camera_id {
+                        latest_binary_by_cam.insert(id, data);
+                    }
                 }
                 WsEvent::Message(WsMessage::Text(text)) => {
                     if let Ok(msg) = serde_json::from_str::<ServerMessage>(&text) {
@@ -711,7 +722,7 @@ impl eframe::App for App {
             }
         }
 
-        if let Some(data) = latest_binary {
+        for (_id, data) in latest_binary_by_cam {
             self.handle_binary_message(ctx, &data);
         }
         if let Some(pts) = latest_tracking {

@@ -27,9 +27,9 @@ pub struct CameraIntrinsics {
 }
 
 impl Default for CameraIntrinsics {
-    /// Typical Intel RealSense D455 values at 1280×720. Used as a fallback only.
+    /// Typical Intel RealSense D435 values at 848×480. Used as a fallback only.
     fn default() -> Self {
-        Self { fx: 1230.0, fy: 1230.0, ppx: 640.0, ppy: 360.0 }
+        Self { fx: 607.0, fy: 607.0, ppx: 424.0, ppy: 240.0 }
     }
 }
 
@@ -103,14 +103,17 @@ impl Camera {
         config
             .enable_device_from_serial(&serial_c)
             .context("Failed to bind pipeline to camera serial")?;
+        // 848×480 keeps three D435s within USB 3.0 bandwidth on a single host
+        // controller. 1280×720 on all three streams saturates the bus and two
+        // cameras hang in pipeline.start() waiting for frames that never arrive.
         config
-            .enable_stream(Rs2StreamKind::Color, None, 1280, 720, Rs2Format::Rgb8, 30)
+            .enable_stream(Rs2StreamKind::Color, None, 848, 480, Rs2Format::Rgb8, 30)
             .context("Failed to enable color stream")?;
         config
-            .enable_stream(Rs2StreamKind::Infrared, None, 1280, 720, Rs2Format::Y8, 30)
+            .enable_stream(Rs2StreamKind::Infrared, None, 848, 480, Rs2Format::Y8, 30)
             .context("Failed to enable infrared stream")?;
         config
-            .enable_stream(Rs2StreamKind::Depth, None, 1280, 720, Rs2Format::Z16, 30)
+            .enable_stream(Rs2StreamKind::Depth, None, 848, 480, Rs2Format::Z16, 30)
             .context("Failed to enable depth stream")?;
 
         let pipeline = pipeline
