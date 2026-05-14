@@ -456,20 +456,27 @@ async fn main() -> Result<()> {
         let enabled = tracking_enabled.clone();
         tokio::spawn(async move {
             while let Some(xyzs) = db_rx.recv().await {
-                let points = db::write_detections(&pool, &xyzs).await;
-                if points.is_empty() {
-                    continue;
+                // Coalesce any backlog — for tracking, only the freshest batch
+                // matters. Without this, a single slow DB write permanently
+                // delays the renderer by however many batches accumulated.
+                let mut latest = xyzs;
+                while let Ok(next) = db_rx.try_recv() {
+                    latest = next;
                 }
 
-                // Update renderer with the first tracked position (primary person).
-                // Virtual override wins when set; when tracking is disabled, hold
-                // the renderer's last value so the operator can freeze-frame the LEDs.
+                // Update the renderer first (non-blocking) so LED tracking never
+                // waits on Postgres. Virtual override wins when set; when tracking
+                // is disabled, hold the last value so the operator can freeze-frame.
                 if enabled.load(Ordering::Relaxed) {
-                    let renderer_pos = points.first().map(|p| [p.x, p.y, p.z]);
+                    let renderer_pos = latest.first().copied();
                     let effective = virt.read().unwrap().or(renderer_pos);
                     let _ = pos_tx.send(effective);
                 }
 
+                let points = db::write_detections(&pool, &latest).await;
+                if points.is_empty() {
+                    continue;
+                }
                 if let Ok(json) = serde_json::to_string(&ServerMessage::Tracking(points)) {
                     // Ignore error — no WS subscribers connected is fine.
                     let _ = ws_tx.send(json);
